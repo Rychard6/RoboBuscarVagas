@@ -60,10 +60,10 @@ O histórico continua no cache gratuito do GitHub Actions, não em armazenamento
 
 - Vagas de alta prioridade (80–100) são notificadas logo após a busca.
 - Média (60–79) e baixa (abaixo de 60) ficam pendentes para o resumo diário.
-- O resumo diário e o heartbeat são programados para **23:50 UTC (20:50 em Brasília)**. O estado persiste a data do último resumo para impedir repetição no mesmo dia; a execução manual não envia o resumo diário.
+- O resumo diário e o heartbeat são programados para **23:55 UTC (20:55 em Brasília)**. O estado persiste a data do último resumo para impedir repetição no mesmo dia; a execução manual não envia o resumo diário.
 - Cada mensagem inclui radar, pontuação/prioridade, contrato, modalidade, localidade, turno, salário, tecnologias, requisitos, compatibilidade, pontos de atenção, data, status e link original.
 
-Há seis grupos de busca por execução, com até 10 resultados por consulta. O cron roda a cada quatro horas (`50 3,7,11,15,19,23 * * *`), aproximadamente 36 créditos Serper/dia antes de execuções manuais. O resumo é enviado somente na execução de 23:50 UTC, sem uma busca adicional. O saldo gratuito do Serper é limitado; reduza grupos ou frequência se necessário. Nenhum scraping autenticado, CAPTCHA ou endpoint privado é utilizado.
+Há seis grupos de busca por execução, com até 10 resultados por consulta. O cron roda a cada quatro horas (`55 3,7,11,15,19,23 * * *`), aproximadamente 36 créditos Serper/dia antes de execuções manuais. O resumo é enviado somente na execução de 23:55 UTC, sem uma busca adicional. O saldo gratuito do Serper é limitado; reduza grupos ou frequência se necessário. Nenhum scraping autenticado, CAPTCHA ou endpoint privado é utilizado.
 
 ## Testes
 

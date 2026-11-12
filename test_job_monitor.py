@@ -256,8 +256,8 @@ class JobHistoryTests(unittest.TestCase):
             scraper.mark_jobs_as_seen(digest)
             self.assertEqual(scraper.get_pending_digest(), [])
 
-    def test_daily_digest_is_due_once_at_2350_utc_and_date_is_persisted(self):
-        now = datetime(2025, 1, 2, 23, 50, tzinfo=timezone.utc)
+    def test_daily_digest_is_due_once_at_2355_utc_and_date_is_persisted(self):
+        now = datetime(2025, 1, 2, 23, 55, tzinfo=timezone.utc)
         self.assertTrue(job_monitor.is_daily_digest_due(now, "", "schedule"))
         self.assertFalse(
             job_monitor.is_daily_digest_due(now, "2025-01-02", "schedule")
@@ -265,7 +265,7 @@ class JobHistoryTests(unittest.TestCase):
         self.assertFalse(job_monitor.is_daily_digest_due(now, "", "workflow_dispatch"))
         self.assertFalse(
             job_monitor.is_daily_digest_due(
-                datetime(2025, 1, 2, 23, 49, tzinfo=timezone.utc),
+                datetime(2025, 1, 2, 23, 54, tzinfo=timezone.utc),
                 "",
                 "schedule",
             )
@@ -306,7 +306,7 @@ class JobHistoryTests(unittest.TestCase):
         workflow = (
             Path(__file__).parent / ".github" / "workflows" / "job-monitor.yml"
         ).read_text(encoding="utf-8")
-        self.assertIn('cron: "50 3,7,11,15,19,23 * * *"', workflow)
+        self.assertIn('cron: "55 3,7,11,15,19,23 * * *"', workflow)
         self.assertIn("github.run_id }}-${{ github.run_attempt", workflow)
         self.assertIn("branches:\n      - developer", workflow)
         self.assertEqual(workflow.count("key: seen-jobs-${{ github.run_id }}-${{ github.run_attempt }}"), 2)

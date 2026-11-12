@@ -9,9 +9,9 @@ on:
       - developer
 
   schedule:
-    # Run every 4 hours; 23:50 UTC is 20:50 in Brasília.
+    # Run every 4 hours; 23:55 UTC is 20:55 in Brasília.
     # All configured query groups run each cycle; this is the worst-case alert latency.
-    - cron: "50 3,7,11,15,19,23 * * *"
+    - cron: "55 3,7,11,15,19,23 * * *"
 
   workflow_dispatch:
     inputs:
