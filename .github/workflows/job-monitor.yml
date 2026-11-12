@@ -4,6 +4,10 @@
 name: Job Monitor Bot
 
 on:
+  push:
+    branches:
+      - developer
+
   schedule:
     # Run every 4 hours; 23:30 UTC is 20:30 in Brasília.
     # All configured query groups run each cycle; this is the worst-case alert latency.
