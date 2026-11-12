@@ -1514,7 +1514,7 @@ def is_daily_digest_due(
     last_digest_date: str,
     event_name: str,
     heartbeat_hour_utc: int = 23,
-    heartbeat_minute_utc: int = 30,
+    heartbeat_minute_utc: int = 50,
 ) -> bool:
     return (
         event_name == 'schedule'
@@ -1721,7 +1721,7 @@ async def main(
                 scraper.last_digest_date,
                 os.getenv('GITHUB_EVENT_NAME', ''),
                 int(NOTIFICATIONS_CONFIG.get('heartbeat_hour_utc', 23)),
-                int(NOTIFICATIONS_CONFIG.get('heartbeat_minute_utc', 30)),
+                int(NOTIFICATIONS_CONFIG.get('heartbeat_minute_utc', 50)),
             )
             digest_jobs = scraper.get_pending_digest() if digest_due else []
             if digest_jobs:
