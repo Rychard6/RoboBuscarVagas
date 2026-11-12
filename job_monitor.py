@@ -1,6 +1,6 @@
 """
-Job Monitor Bot - searches Google (via Serper.dev) for new remote job postings
-and sends Telegram notifications.
+Job Monitor Bot - searches Google (via Serper.dev) for jobs matching two independent
+radars and sends ranked Telegram notifications.
 Features: async search, retry logic, YAML config, structured logging, heartbeat alerts
 """
 
@@ -13,15 +13,19 @@ import json
 import logging
 import os
 import random
-import re
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yaml
+from radar_logic import evaluate_job
+
+# Keep emoji and Portuguese text in console reports usable on Windows terminals.
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 # ============= LOGGING SETUP =============
 logging.basicConfig(
@@ -45,7 +49,7 @@ GOOGLE_SEARCH_CONFIG_PATH = Path(__file__).parent / 'google_search_sites.yaml'
 def load_config() -> dict:
     try:
         if CONFIG_PATH.exists():
-            with open(CONFIG_PATH, 'r') as f:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
                 return yaml.safe_load(f)
         logger.warning(f"Config file not found at {CONFIG_PATH}, using defaults")
         return {'sites': {}, 'request': {}}
@@ -56,17 +60,17 @@ def load_config() -> dict:
 def load_google_search_config() -> dict:
     try:
         if GOOGLE_SEARCH_CONFIG_PATH.exists():
-            with open(GOOGLE_SEARCH_CONFIG_PATH, 'r') as f:
+            with open(GOOGLE_SEARCH_CONFIG_PATH, 'r', encoding='utf-8') as f:
                 return yaml.safe_load(f)
         logger.warning(f"Google search config not found at {GOOGLE_SEARCH_CONFIG_PATH}")
-        return {'settings': {'enabled': False}, 'keywords': [], 'sites': []}
+        return {'settings': {'enabled': False}, 'queries': {}, 'sites': []}
     except Exception as e:
         logger.error(f"Error loading Google search config: {e}")
-        return {'settings': {'enabled': False}, 'keywords': [], 'sites': []}
+        return {'settings': {'enabled': False}, 'queries': {}, 'sites': []}
 
 CONFIG = load_config()
 REQUEST_CONFIG = CONFIG.get('request', {})
-LOCATION_FILTER_CONFIG = CONFIG.get('location_filter', {})
+RADAR_CONFIG = CONFIG.get('radars', {})
 NOTIFICATIONS_CONFIG = CONFIG.get('notifications', {})
 TIMEOUT = REQUEST_CONFIG.get('timeout', 15)
 MAX_RETRIES = REQUEST_CONFIG.get('max_retries', 3)
@@ -75,6 +79,7 @@ RETRY_MAX_DELAY = REQUEST_CONFIG.get('retry_max_delay', 10.0)
 CONCURRENT_LIMIT = REQUEST_CONFIG.get('concurrent_limit', 10)
 SEEN_JOBS_MAX = REQUEST_CONFIG.get('seen_jobs_max', 5000)
 SEEN_JOBS_TTL_DAYS = REQUEST_CONFIG.get('seen_jobs_ttl_days', 90)
+JOB_HISTORY_MAX = REQUEST_CONFIG.get('job_history_max', SEEN_JOBS_MAX)
 TELEGRAM_MAX_RETRIES = REQUEST_CONFIG.get('telegram_max_retries', 3)
 TELEGRAM_RETRY_BASE_DELAY = REQUEST_CONFIG.get('telegram_retry_base_delay', 1.0)
 TELEGRAM_RETRY_MAX_DELAY = REQUEST_CONFIG.get('telegram_retry_max_delay', 10.0)
@@ -322,63 +327,9 @@ http_client = AsyncHTTPClient()
 class JobSiteScraper:
     def __init__(self, seen_jobs_file: str = 'seen_jobs.json'):
         self.seen_jobs_file = seen_jobs_file
+        self.job_history: dict[str, dict[str, Any]] = {}
+        self.last_digest_date = ''
         self.seen_jobs = self.load_seen_jobs()
-        self.pending_job_ids: set[str] = set()
-        self.location_filter_mode = str(
-            LOCATION_FILTER_CONFIG.get('location_filter_mode', 'strict_remote_with_exception')
-        ).strip().lower()
-        self.location_remote_terms = coerce_string_list(
-            LOCATION_FILTER_CONFIG.get('location_remote_terms'),
-            [
-                'remote',
-                'work from home',
-                'wfh',
-                'distributed',
-                'anywhere',
-            ]
-        )
-        self.location_hybrid_terms = coerce_string_list(
-            LOCATION_FILTER_CONFIG.get('location_hybrid_terms'),
-            [
-                'hybrid',
-                '2 days onsite',
-                '3 days onsite',
-                'partially remote',
-            ]
-        )
-        self.location_onsite_terms = coerce_string_list(
-            LOCATION_FILTER_CONFIG.get('location_onsite_terms'),
-            [
-                'onsite',
-                'on-site',
-                'in office',
-                'office based',
-                'on site',
-            ]
-        )
-        self.location_exception_terms = coerce_string_list(
-            LOCATION_FILTER_CONFIG.get('location_exception_terms'),
-            [
-                'visa sponsorship',
-                'sponsorship available',
-                'relocation support',
-                'willing to relocate',
-                'relocation assistance',
-            ]
-        )
-        self.accept_unspecified_location = bool(
-            LOCATION_FILTER_CONFIG.get('accept_unspecified_location', False)
-        )
-        # Always-on exclude list (independent of location_filter_mode): drop results whose
-        # title/snippet mentions any of these as a WHOLE WORD. Whole-word matching keeps
-        # "india" from nuking "Indiana"/"Indianapolis".
-        self.exclude_location_terms = coerce_string_list(
-            LOCATION_FILTER_CONFIG.get('exclude_location_terms'), []
-        )
-        self._exclude_location_patterns = [
-            re.compile(rf'(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])')
-            for term in self.exclude_location_terms
-        ]
         self.metrics = {
             'google_queries_available': 0,
             'google_queries_executed': 0,
@@ -386,20 +337,30 @@ class JobSiteScraper:
             'google_rate_limited': 0,
             'google_stopped_early_reason': '',
             'google_last_error': '',
-            'jobs_rejected_location': 0,
-            'jobs_excluded_location': 0,
-            'jobs_accepted_exception': 0,
+            'jobs_rejected_radar': 0,
         }
     
     def load_seen_jobs(self) -> dict[str, float]:
         try:
             if os.path.exists(self.seen_jobs_file):
-                with open(self.seen_jobs_file, 'r') as f:
+                with open(self.seen_jobs_file, 'r', encoding='utf-8') as f:
                     payload = json.load(f)
                     now = time.time()
                     if isinstance(payload, list):
                         return {job_id: now for job_id in payload if isinstance(job_id, str)}
                     if isinstance(payload, dict):
+                        if 'seen_jobs' in payload:
+                            self.job_history = (
+                                payload.get('jobs', {})
+                                if isinstance(payload.get('jobs'), dict)
+                                else {}
+                            )
+                            self.last_digest_date = str(
+                                payload.get('last_digest_date') or ''
+                            )
+                            payload = payload.get('seen_jobs', {})
+                            if not isinstance(payload, dict):
+                                return {}
                         seen: dict[str, float] = {}
                         for job_id, ts in payload.items():
                             if isinstance(job_id, str):
@@ -413,18 +374,30 @@ class JobSiteScraper:
             logger.error(f"Error loading seen jobs: {e}")
             return {}
     
-    def save_seen_jobs(self):
+    def save_seen_jobs(self) -> bool:
         try:
             self._prune_seen_jobs()
-            with open(self.seen_jobs_file, 'w') as f:
-                json.dump(self.seen_jobs, f)
-            logger.info(f"Saved {len(self.seen_jobs)} seen jobs")
+            with open(self.seen_jobs_file, 'w', encoding='utf-8') as f:
+                json.dump(
+                    {
+                        'version': 2,
+                        'seen_jobs': self.seen_jobs,
+                        'jobs': self.job_history,
+                        'last_digest_date': self.last_digest_date,
+                    },
+                    f,
+                    ensure_ascii=False,
+                )
+            logger.info(
+                f"Saved {len(self.seen_jobs)} deduplication records and "
+                f"{len(self.job_history)} opportunity records"
+            )
+            return True
         except Exception as e:
             logger.error(f"Error saving seen jobs: {e}")
+            return False
 
     def _prune_seen_jobs(self):
-        if not self.seen_jobs:
-            return
         now = time.time()
         ttl_seconds = SEEN_JOBS_TTL_DAYS * 24 * 60 * 60
         self.seen_jobs = {
@@ -435,87 +408,123 @@ class JobSiteScraper:
         if len(self.seen_jobs) > SEEN_JOBS_MAX:
             newest_first = sorted(self.seen_jobs.items(), key=lambda item: item[1], reverse=True)
             self.seen_jobs = dict(newest_first[:SEEN_JOBS_MAX])
+        self.job_history = {
+            job_id: record
+            for job_id, record in self.job_history.items()
+            if now - float(record.get('updated_at', now)) <= ttl_seconds
+        }
+        if len(self.job_history) > JOB_HISTORY_MAX:
+            newest_first = sorted(
+                self.job_history.items(),
+                key=lambda item: float(item[1].get('updated_at', 0)),
+                reverse=True,
+            )
+            self.job_history = dict(newest_first[:JOB_HISTORY_MAX])
     
     def generate_job_id(self, url: str) -> str:
         # Dedup on the normalized URL alone — it uniquely identifies a posting and is
         # immune to Google title/snippet drift and trailing-slash/host-case variants.
         return hashlib.md5(normalize_job_url(url).encode()).hexdigest()
     
-    def is_new_job(self, job_id: str) -> bool:
-        return job_id not in self.seen_jobs and job_id not in self.pending_job_ids
-    
-    def queue_job_id(self, job_id: str):
-        self.pending_job_ids.add(job_id)
-
-    def mark_jobs_as_seen(self, job_ids: list[str]):
+    def mark_jobs_as_seen(self, jobs: list[dict[str, Any]]):
         now = time.time()
-        for job_id in job_ids:
+        for job in jobs:
+            job_id = job.get('id', '')
+            record = self.job_history.get(job_id, {})
+            radar_ids = job.get('radar_ids') or [job.get('radar_id', '')]
+            for radar_id in radar_ids:
+                radar_record = record.get('radars', {}).get(radar_id)
+                if radar_record:
+                    radar_record['delivery_status'] = 'notified'
+                    radar_record['notified_at'] = now
+            record['updated_at'] = now
+            record['notification_sent_at'] = now
             self.seen_jobs[job_id] = now
-            self.pending_job_ids.discard(job_id)
+
+    def get_pending_digest(self) -> list[dict[str, Any]]:
+        pending: list[dict[str, Any]] = []
+        for job_id, record in self.job_history.items():
+            for radar_id, radar_record in record.get('radars', {}).items():
+                if radar_record.get('delivery_status') != 'pending_digest':
+                    continue
+                pending.append(
+                    {
+                        **record,
+                        **radar_record,
+                        'id': job_id,
+                        'radar_id': radar_id,
+                    }
+                )
+        return self._combine_radar_matches(pending)
 
     @staticmethod
-    def _contains_any_term(text: str, terms: list[str]) -> bool:
-        return any(term in text for term in terms)
+    def _combine_radar_matches(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for job in jobs:
+            grouped.setdefault(job['id'], []).append(job)
 
-    def classify_location(self, job: dict) -> dict[str, Any]:
-        if self.location_filter_mode != 'strict_remote_with_exception':
-            return {'accepted': True, 'accepted_by_exception': False, 'reason': 'filter_disabled'}
+        combined: list[dict[str, Any]] = []
+        for matches in grouped.values():
+            best = max(matches, key=lambda match: match.get('score', 0))
+            radar_results = [
+                {
+                    key: match[key]
+                    for key in (
+                        'radar_id', 'radar_label', 'score', 'priority',
+                        'fit_reason', 'incompatibilities', 'tracking_status',
+                    )
+                    if key in match
+                }
+                for match in matches
+            ]
+            combined.append(
+                {
+                    **best,
+                    'radar_ids': [match['radar_id'] for match in matches],
+                    'radar_results': radar_results,
+                    'is_high_priority': any(
+                        match.get('priority') == 'Alta prioridade' for match in matches
+                    ),
+                }
+            )
+        return combined
 
-        title = str(job.get('title', '')).lower()
-        description = str(job.get('description', '')).lower()
-        searchable = f"{title} {description}"
+    def update_tracking_status(self, job_id_prefix: str, status: str) -> bool:
+        return self.update_radar_tracking_status(job_id_prefix, None, status)
 
-        has_remote = self._contains_any_term(searchable, self.location_remote_terms)
-        has_hybrid = self._contains_any_term(searchable, self.location_hybrid_terms)
-        has_onsite = self._contains_any_term(searchable, self.location_onsite_terms)
-        has_exception = self._contains_any_term(searchable, self.location_exception_terms)
-
-        if has_remote:
-            return {'accepted': True, 'accepted_by_exception': False, 'reason': 'remote'}
-        if (has_hybrid or has_onsite) and has_exception:
-            return {
-                'accepted': True,
-                'accepted_by_exception': True,
-                'reason': 'onsite_or_hybrid_with_visa_or_relocation_exception',
-            }
-        if has_hybrid:
-            return {'accepted': False, 'accepted_by_exception': False, 'reason': 'hybrid_without_exception'}
-        if has_onsite:
-            return {'accepted': False, 'accepted_by_exception': False, 'reason': 'onsite_without_exception'}
-        if self.accept_unspecified_location:
-            return {'accepted': True, 'accepted_by_exception': False, 'reason': 'location_unspecified_accepted'}
-        return {'accepted': False, 'accepted_by_exception': False, 'reason': 'location_unspecified_without_exception'}
-
-    def matched_exclude_term(self, job: dict) -> Optional[str]:
-        """Return the first exclude term appearing as a whole word in the title/snippet, else
-        None. Applied to every result regardless of location_filter_mode."""
-        if not self._exclude_location_patterns:
-            return None
-        searchable = f"{job.get('title', '')} {job.get('description', '')}".lower()
-        for term, pattern in zip(self.exclude_location_terms, self._exclude_location_patterns):
-            if pattern.search(searchable):
-                return term
-        return None
-
-    def location_hint(self, job: dict) -> str:
-        """Short location label for the Telegram message, independent of the filter mode
-        (which may be off). Best-effort from the title+snippet — open the link to confirm."""
-        searchable = f"{job.get('title', '')} {job.get('description', '')}".lower()
-        has_remote = self._contains_any_term(searchable, self.location_remote_terms)
-        has_hybrid = self._contains_any_term(searchable, self.location_hybrid_terms)
-        has_onsite = self._contains_any_term(searchable, self.location_onsite_terms)
-        has_exception = self._contains_any_term(searchable, self.location_exception_terms)
-        if has_remote:
-            label = "Remote"
-        elif has_hybrid:
-            label = "Hybrid"
-        elif has_onsite:
-            label = "Onsite"
-        else:
-            label = "Location unclear"
-        if has_exception and label != "Remote":
-            label += " · visa/relocation"
-        return label
+    def update_radar_tracking_status(
+        self, job_id_prefix: str, radar_id: Optional[str], status: str
+    ) -> bool:
+        if len(job_id_prefix) < 8:
+            return False
+        matches = [
+            job_id for job_id in self.job_history
+            if job_id.startswith(job_id_prefix)
+        ]
+        if len(matches) != 1:
+            return False
+        job_id = matches[0]
+        record = self.job_history[job_id]
+        radar_records = record.get('radars', {})
+        if radar_id is None:
+            if len(radar_records) != 1:
+                return False
+            radar_id = next(iter(radar_records))
+        if radar_id not in radar_records:
+            return False
+        radar_record = radar_records[radar_id]
+        legacy_status = record.get('tracking_status')
+        for existing in radar_records.values():
+            if legacy_status:
+                existing.setdefault('tracking_status', legacy_status)
+            if not isinstance(existing.get('status_history'), list):
+                existing['status_history'] = []
+        radar_record['tracking_status'] = status
+        radar_record['status_history'].append(
+            {'status': status, 'updated_at': time.time()}
+        )
+        record['updated_at'] = time.time()
+        return self.save_seen_jobs()
 
     def log_operational_metrics(self):
         logger.info(
@@ -526,95 +535,28 @@ class JobSiteScraper:
             f"  google_rate_limited={self.metrics['google_rate_limited']}\n"
             f"  google_stopped_early_reason={self.metrics['google_stopped_early_reason'] or 'none'}\n"
             f"  google_last_error={self.metrics['google_last_error'] or 'none'}\n"
-            f"  jobs_rejected_location={self.metrics['jobs_rejected_location']}\n"
-            f"  jobs_excluded_location={self.metrics['jobs_excluded_location']}\n"
-            f"  jobs_accepted_exception={self.metrics['jobs_accepted_exception']}"
+            f"  jobs_rejected_radar={self.metrics['jobs_rejected_radar']}"
         )
-    
-    def _handle_search_item(
-        self,
-        raw_title: str,
-        raw_link: str,
-        snippet: str,
-        source_label: str,
-        site_name: str,
-        jobs: list[dict],
-    ):
-        """Process one Serper search result into a job, applying the location filter and
-        dedup. Mutates `jobs` and metrics in place. The search query is the keyword authority,
-        so there is no title/snippet keyword re-check here."""
-        title = (raw_title or '').strip()
-        job_url = normalize_job_url(raw_link or '')
-        if not title or not job_url:
-            return
-
-        company = ''
-        if ' - ' in title:
-            parts = title.rsplit(' - ', 1)
-            if len(parts) == 2:
-                title, company = parts[0].strip(), parts[1].strip()
-        elif ' | ' in title:
-            parts = title.rsplit(' | ', 1)
-            if len(parts) == 2:
-                title, company = parts[0].strip(), parts[1].strip()
-
-        job = {
-            'title': title,
-            'company': company,
-            'url': job_url,
-            'source': source_label,
-            'description': snippet or '',
-        }
-        job_id = self.generate_job_id(job_url)
-
-        if not self.is_new_job(job_id):
-            return
-
-        excluded_term = self.matched_exclude_term(job)
-        if excluded_term:
-            self.metrics['jobs_excluded_location'] += 1
-            self.queue_job_id(job_id)  # don't re-evaluate/re-count this URL again this run
-            logger.info(f"{site_name}: Excluded (matched '{excluded_term}'): {title[:120]}")
-            return
-
-        location_result = self.classify_location(job)
-        if not location_result['accepted']:
-            self.metrics['jobs_rejected_location'] += 1
-            logger.info(
-                f"{site_name}: Rejected by location filter "
-                f"({location_result['reason']}): {title[:120]}"
-            )
-            return
-        if location_result['accepted_by_exception']:
-            self.metrics['jobs_accepted_exception'] += 1
-        job['id'] = job_id
-        job['location_reason'] = location_result['reason']
-        job['location_hint'] = self.location_hint(job)
-        jobs.append(job)
-        self.queue_job_id(job_id)
 
     # ============= SERPER.DEV (GOOGLE RESULTS VIA SINGLE API KEY) =============
     async def scrape_serper_search(self) -> list[dict]:
-        """Search for jobs via Serper.dev (real Google results, one API key, no CSE).
-
-        Reuses the same keyword/site queries, rotation budget, and filtering as the
-        Google CSE path; only the transport (POST + X-API-KEY) and freshness param differ.
-        """
-        jobs = []
+        """Search both radars, deduplicate URLs, then apply their mandatory rules and scores."""
+        candidates: list[dict[str, Any]] = []
+        jobs_by_id: dict[str, dict[str, Any]] = {}
         site_name = "SerperSearch"
 
         if not SERPER_API_KEY:
             logger.debug(f"{site_name}: Skipped (no SERPER_API_KEY)")
-            return jobs
+            return candidates
 
         search_config = load_google_search_config()
         settings = search_config.get('settings', {})
 
         if not settings.get('enabled', False):
             logger.debug(f"{site_name}: Disabled in config")
-            return jobs
+            return candidates
 
-        keywords = search_config.get('keywords', [])
+        queries_by_radar = search_config.get('queries', {})
         sites = search_config.get('sites', [])
         max_results = settings.get('max_results_per_query', 10)
         min_seconds_between_queries = max(0.0, float(settings.get('min_seconds_between_queries', 1.0)))
@@ -623,8 +565,9 @@ class JobSiteScraper:
         serper_stop_on_rate_limit = bool(settings.get('serper_stop_on_rate_limit', True))
         # Serper time filter: qdr:h/d/w/m/y (hour/day/week/month/year). Empty = no filter.
         serper_time_filter = str(settings.get('serper_time_filter', 'qdr:d')).strip()
-        # Country bias(es) for Google ranking (gl). One request is sent per (keyword, country),
-        # so total searches = keywords × countries. Accepts a list or comma-separated string,
+        serper_language = str(settings.get('serper_language', '')).strip()
+        # Country bias(es) for Google ranking (gl). One request is sent per (query, country),
+        # so total searches = configured query groups × countries. Accepts a list or string,
         # and the legacy single 'serper_country'. Empty => one unbiased search.
         raw_countries = settings.get('serper_countries', settings.get('serper_country', ''))
         if isinstance(raw_countries, str):
@@ -641,9 +584,9 @@ class JobSiteScraper:
         )
         jitter_max_seconds = max(0.0, min(float(settings.get('query_jitter_max_seconds', 0.4)), 2.0))
 
-        if not keywords or not sites:
-            logger.warning(f"{site_name}: No keywords or sites configured")
-            return jobs
+        if not queries_by_radar or not sites:
+            logger.warning(f"{site_name}: No radar queries or sites configured")
+            return candidates
 
         # Map result domains back to friendly board names for the alert "source" label.
         domain_to_name = {
@@ -653,25 +596,23 @@ class JobSiteScraper:
         domains = list(domain_to_name.keys())
 
         try:
-            # One combined query per keyword across ALL boards via (site:a OR site:b ...),
-            # so every run covers every board+keyword — no rotation, latency = cron interval.
             site_clause = "(" + " OR ".join(f"site:{d}" for d in domains) + ")"
             negative_clause = " ".join(
                 f"-{term.lstrip('-').strip()}"
                 for term in negative_terms
                 if term and term.lstrip('-').strip()
             )
-            # One query per keyword (no location terms baked in — every matching role is
-            # returned regardless of remote/onsite/hybrid; set query_negative_terms to
-            # re-exclude). Fan out across countries: one request per (keyword, country).
-            query_specs: list[tuple[str, str]] = []
-            for keyword in keywords:
-                query_parts = [keyword, site_clause]
-                if negative_clause:
-                    query_parts.append(negative_clause)
-                query = " ".join(query_parts)
-                for gl in countries:
-                    query_specs.append((query, gl))
+            query_specs: list[tuple[str, str, str]] = []
+            for radar_id, radar_queries in queries_by_radar.items():
+                if radar_id not in RADAR_CONFIG.get('radars', {}):
+                    logger.warning(f"{site_name}: Ignoring unknown radar '{radar_id}'")
+                    continue
+                for radar_query in radar_queries or []:
+                    query_parts = [str(radar_query), site_clause]
+                    if negative_clause:
+                        query_parts.append(negative_clause)
+                    for gl in countries:
+                        query_specs.append((radar_id, " ".join(query_parts), gl))
             self.metrics['google_queries_available'] = len(query_specs)
 
             total_queries = 0
@@ -680,12 +621,14 @@ class JobSiteScraper:
             def next_query_delay() -> float:
                 return min_seconds_between_queries + random.uniform(0.0, jitter_max_seconds)
 
-            for query, gl in query_specs:
+            for radar_id, query, gl in query_specs:
                 payload: dict[str, Any] = {'q': query, 'num': max_results}
                 if serper_time_filter:
                     payload['tbs'] = serper_time_filter
                 if gl:
                     payload['gl'] = gl
+                if serper_language:
+                    payload['hl'] = serper_language
 
                 error_state: dict[str, Any] = {}
                 data = await http_client.post_json(
@@ -724,26 +667,142 @@ class JobSiteScraper:
                 consecutive_failures = 0
                 for item in data.get('organic', []) or []:
                     link = item.get('link', '')
+                    title = str(item.get('title', '')).strip()
+                    job_url = normalize_job_url(link)
+                    if not title or not job_url:
+                        continue
+                    company = ''
+                    if ' - ' in title:
+                        title, company = (part.strip() for part in title.rsplit(' - ', 1))
+                    elif ' | ' in title:
+                        title, company = (part.strip() for part in title.rsplit(' | ', 1))
+                    job_id = self.generate_job_id(job_url)
+                    # Preserve the old ID-only state without treating this run's duplicates
+                    # across source/radar queries as already notified.
+                    if job_id in self.seen_jobs and job_id not in self.job_history:
+                        continue
                     netloc = urlsplit(link).netloc.lower()
-                    board = next((name for dom, name in domain_to_name.items() if dom in netloc), 'Search')
-                    self._handle_search_item(
-                        item.get('title', ''),
-                        link,
-                        item.get('snippet', ''),
-                        f"Serper-{board}",
-                        site_name,
-                        jobs,
+                    board = next(
+                        (
+                            name for dom, name in domain_to_name.items()
+                            if dom.split('/')[0] in netloc
+                        ),
+                        'Search',
                     )
+                    source = f"Serper-{board}"
+                    description = str(item.get('snippet', '')).strip()
+                    if job_id not in jobs_by_id:
+                        jobs_by_id[job_id] = {
+                            'id': job_id,
+                            'title': title,
+                            'company': company,
+                            'url': job_url,
+                            'source': source,
+                            'sources': [source],
+                            'description': description,
+                            'published_at': item.get('date') or item.get('datePublished') or '',
+                        }
+                    else:
+                        existing = jobs_by_id[job_id]
+                        if source not in existing['sources']:
+                            existing['sources'].append(source)
+                        if len(description) > len(existing['description']):
+                            existing['description'] = description
+                        if not existing.get('published_at'):
+                            existing['published_at'] = (
+                                item.get('date') or item.get('datePublished') or ''
+                            )
 
                 await asyncio.sleep(next_query_delay())
 
-            health_tracker.record_success(site_name, len(jobs))
-            logger.info(f"{site_name}: Found {len(jobs)} new jobs from {total_queries} queries")
+            for job in jobs_by_id.values():
+                job['source'] = ', '.join(job['sources'])
+                for radar_id in queries_by_radar:
+                    if radar_id not in RADAR_CONFIG.get('radars', {}):
+                        continue
+                    result = evaluate_job(job, radar_id, RADAR_CONFIG)
+                    if not result.get('eligible'):
+                        self.metrics['jobs_rejected_radar'] += 1
+                        previous_record = self.job_history.get(job['id'], {})
+                        previous_radar = previous_record.get('radars', {}).get(radar_id, {})
+                        if previous_radar.get('delivery_status') == 'pending_digest':
+                            previous_radar['delivery_status'] = 'ineligible'
+                            previous_record['updated_at'] = time.time()
+                        logger.debug(
+                            f"Rejected {job['title'][:100]} for {radar_id}: "
+                            f"{result.get('reason', 'not eligible')}"
+                        )
+                        continue
+
+                    record = self.job_history.setdefault(
+                        job['id'],
+                        {
+                            'title': job['title'],
+                            'company': job['company'],
+                            'url': job['url'],
+                            'source': job['source'],
+                            'sources': job['sources'],
+                            'description': job['description'],
+                            'published_at': job['published_at'],
+                            'tracking_status': 'nova',
+                            'radars': {},
+                            'created_at': time.time(),
+                        },
+                    )
+                    record.update(
+                        {
+                            'title': job['title'],
+                            'company': job['company'],
+                            'url': job['url'],
+                            'source': job['source'],
+                            'sources': job['sources'],
+                            'description': job['description'],
+                            'published_at': job['published_at'] or record.get('published_at', ''),
+                            'updated_at': time.time(),
+                        }
+                    )
+                    previous = record.setdefault('radars', {}).get(radar_id, {})
+                    radar_record = {
+                        key: value
+                        for key, value in result.items()
+                        if key not in {'eligible', 'tracking_status'}
+                    }
+                    radar_record.update(
+                        {
+                            'delivery_status': previous.get(
+                                'delivery_status', 'pending_digest'
+                            ),
+                            'tracking_status': previous.get(
+                                'tracking_status', record.get('tracking_status', 'nova')
+                            ),
+                            'first_seen_at': previous.get('first_seen_at', time.time()),
+                        }
+                    )
+                    record['radars'][radar_id] = radar_record
+                    if record.get('notification_sent_at'):
+                        radar_record['delivery_status'] = 'notified'
+                        continue
+                    if radar_record['delivery_status'] == 'notified':
+                        continue
+                    candidates.append(
+                        {
+                            **job,
+                            **result,
+                            'tracking_status': radar_record['tracking_status'],
+                        }
+                    )
+
+            health_tracker.record_success(site_name, len(jobs_by_id))
+            candidates = self._combine_radar_matches(candidates)
+            logger.info(
+                f"{site_name}: {len(jobs_by_id)} unique results from {total_queries} queries; "
+                f"{len(candidates)} radar matches"
+            )
         except Exception as e:
             health_tracker.record_failure(site_name, str(e))
             logger.error(f"{site_name} error: {e}")
 
-        return jobs
+        return candidates
 
 # ============= TELEGRAM NOTIFICATION =============
 async def _deliver_telegram_message(session, url: str, payload: dict) -> bool:
@@ -789,7 +848,11 @@ async def _deliver_telegram_message(session, url: str, payload: dict) -> bool:
     return False
 
 
-async def send_telegram_notification(jobs: list[dict]) -> bool:
+async def send_telegram_notification(
+    jobs: list[dict],
+    daily_digest: bool = False,
+    on_delivered: Optional[Callable[[list[dict]], Any]] = None,
+) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram credentials not configured")
         return False
@@ -802,51 +865,90 @@ async def send_telegram_notification(jobs: list[dict]) -> bool:
         session = await http_client.get_session()
 
         def _escape_text(value: str, max_length: int, fallback: str = 'Unknown') -> str:
-            normalized = (value or '').strip()
+            normalized = str(value or '').strip()
             if not normalized:
                 normalized = fallback
             return html.escape(normalized[:max_length], quote=False)
 
-        header = f"🔔 <b>{len(jobs)} New Job(s) Found!</b>\n"
+        header_title = (
+            f"📬 <b>Resumo diário — {len(jobs)} oportunidade(s)</b>"
+            if daily_digest
+            else f"🚨 <b>{len(jobs)} vaga(s) de alta prioridade</b>"
+        )
+        header = f"{header_title}\n"
         header += f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
         header += "─" * 30 + "\n\n"
 
-        messages = []
+        messages: list[tuple[str, list[dict]]] = []
         current_message = header
+        current_jobs: list[dict] = []
 
         for i, job in enumerate(jobs, 1):
             title = _escape_text(job.get('title', ''), 100)
-            company = _escape_text(job.get('company', ''), 50, fallback='')
+            company = _escape_text(job.get('company', ''), 50, fallback='Não informada')
             source = _escape_text(job.get('source', ''), 60)
-            hint = _escape_text(job.get('location_hint', ''), 60, fallback='')
-            snippet = _escape_text(job.get('description', ''), 200, fallback='')
+            contract = _escape_text(job.get('contract', ''), 40)
+            modality = _escape_text(job.get('modality', ''), 40)
+            location = _escape_text(job.get('location', ''), 100)
+            schedule = _escape_text(job.get('schedule', ''), 100)
+            salary = _escape_text(job.get('salary', ''), 60)
+            technologies = _escape_text(
+                ', '.join(job.get('technologies', [])), 180, fallback='Não identificadas'
+            )
+            requirements = _escape_text(
+                job.get('requirements', ''), 350, fallback='Não informado no resultado público'
+            )
+            published_at = _escape_text(job.get('published_at', ''), 60, fallback='Não informada')
             url = html.escape(job.get('url', ''), quote=True)
+            short_id = _escape_text(job.get('id', '')[:12], 12)
 
             job_text = f"<b>{i}. {title}</b>\n"
-            if company:
-                job_text += f"🏢 {company}\n"
-            if hint:
-                job_text += f"📍 {hint}\n"
-            if snippet:
-                job_text += f"📝 {snippet}\n"
-            job_text += f"🌐 {source}\n"
+            job_text += f"🏢 Empresa: {company}\n"
+            for result in job.get('radar_results', []):
+                radar_label = _escape_text(result.get('radar_label', ''), 80)
+                priority = _escape_text(result.get('priority', ''), 40)
+                fit_reason = _escape_text(result.get('fit_reason', ''), 300)
+                incompatibilities = _escape_text(
+                    '; '.join(result.get('incompatibilities', [])), 250, fallback='Nenhum'
+                )
+                tracking_status = _escape_text(
+                    result.get('tracking_status', job.get('tracking_status', 'nova')), 30
+                )
+                score = int(result.get('score', 0))
+                job_text += f"<b>[{radar_label}]</b> ⭐ {score}/100 — {priority}\n"
+                job_text += f"📌 Status neste radar: {tracking_status}\n"
+                job_text += f"✅ Compatibilidade: {fit_reason}\n"
+                job_text += f"⚠️ Atenção: {incompatibilities}\n"
+            job_text += f"📄 Contrato: {contract} | Modalidade: {modality}\n"
+            job_text += f"📍 Localidade: {location}\n"
+            job_text += f"🕒 Horário/escala: {schedule}\n"
+            job_text += f"💰 Salário: {salary}\n"
+            job_text += f"🧰 Tecnologias: {technologies}\n"
+            job_text += f"📋 Requisitos: {requirements}\n"
+            job_text += f"📅 Publicada: {published_at}\n"
+            if source:
+                job_text += f"🌐 Fonte: {source}\n"
+            if short_id:
+                job_text += f"🆔 ID: <code>{short_id}</code>\n"
             if url:
-                job_text += f"🔗 <a href=\"{url}\">Apply Here</a>\n\n"
+                job_text += f"🔗 <a href=\"{url}\">Candidatura original</a>\n\n"
             else:
-                job_text += "🔗 No URL provided\n\n"
+                job_text += "🔗 Link não informado\n\n"
 
             if len(current_message) + len(job_text) > 4000:
-                messages.append(current_message)
+                messages.append((current_message, current_jobs))
                 current_message = header + job_text
+                current_jobs = [job]
             else:
                 current_message += job_text
+                current_jobs.append(job)
 
         if current_message:
-            messages.append(current_message)
+            messages.append((current_message, current_jobs))
 
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-        for msg in messages:
+        for msg, message_jobs in messages:
             payload = {
                 'chat_id': TELEGRAM_CHAT_ID,
                 'text': msg,
@@ -856,6 +958,8 @@ async def send_telegram_notification(jobs: list[dict]) -> bool:
 
             if not await _deliver_telegram_message(session, url, payload):
                 return False
+            if on_delivered:
+                await on_delivered(message_jobs)
 
             await asyncio.sleep(0.5)
 
@@ -920,29 +1024,73 @@ def build_status_message(metrics: dict, new_job_count: int, issues: list[str]) -
         f"🔎 Search queries: {metrics.get('google_queries_executed', 0)}"
         f"/{metrics.get('google_queries_available', 0)}"
     )
-    rejected = metrics.get('jobs_rejected_location', 0)
+    rejected = metrics.get('jobs_rejected_radar', 0)
     if rejected:
-        lines.append(f"📍 Rejected by location filter: {rejected}")
-    excluded = metrics.get('jobs_excluded_location', 0)
-    if excluded:
-        lines.append(f"🚫 Excluded (location): {excluded}")
+        lines.append(f"🚫 Rejected by mandatory radar rules: {rejected}")
     working = health_tracker.get_working_sites()
     if working:
         summary = ", ".join(f"{w['site']}({w['jobs_found']})" for w in working)
         lines.append(f"🌐 Sources: {html.escape(summary, quote=False)}")
     return "\n".join(lines)
 
+
+def is_daily_digest_due(
+    now: datetime,
+    last_digest_date: str,
+    event_name: str,
+    heartbeat_hour_utc: int = 23,
+    heartbeat_minute_utc: int = 30,
+) -> bool:
+    return (
+        event_name == 'schedule'
+        and now.hour == heartbeat_hour_utc
+        and now.minute >= heartbeat_minute_utc
+        and now.date().isoformat() != last_digest_date
+    )
+
+
 # ============= CLI ARGUMENT PARSING =============
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Job Monitor Bot - searches Google via Serper.dev and sends Telegram notifications'
+        description='Monitor de vagas com os radares de segunda renda e carreira em tecnologia'
     )
+    commands = parser.add_mutually_exclusive_group()
     parser.add_argument(
         '--dry-run',
         action='store_true',
         help='Test mode: search but skip Telegram notifications and seen_jobs.json updates. Prints a report of what was found.'
     )
+    commands.add_argument(
+        '--history',
+        action='store_true',
+        help='List saved opportunities and their radar/delivery/tracking statuses.'
+    )
+    commands.add_argument(
+        '--set-status',
+        nargs='+',
+        metavar='VALUE',
+        help='Update status: JOB_ID RADAR STATUS (RADAR is radar_a or radar_b).'
+    )
     return parser.parse_args()
+
+
+def print_history(scraper: JobSiteScraper):
+    print(f"\nHISTÓRICO DE OPORTUNIDADES ({len(scraper.job_history)})")
+    for job_id, record in sorted(
+        scraper.job_history.items(),
+        key=lambda item: float(item[1].get('updated_at', 0)),
+        reverse=True,
+    ):
+        print(f"\n[{job_id[:12]}] {record.get('title', 'Cargo não informado')}")
+        print(f"  Link: {record.get('url', '')}")
+        for radar_id, radar in record.get('radars', {}).items():
+            print(
+                f"  {radar.get('radar_label', radar_id)}: "
+                f"{radar.get('score', 0)}/100 — {radar.get('priority', '')}; "
+                f"status={radar.get('tracking_status', record.get('tracking_status', 'nova'))}; "
+                f"notificação={radar.get('delivery_status', 'pendente')}"
+            )
+
 
 def print_dry_run_report(jobs: list[dict]):
     """Print detailed report for dry-run mode."""
@@ -983,6 +1131,11 @@ def print_dry_run_report(jobs: list[dict]):
             source = job.get('source', 'Unknown')
             print(f"  {i}. [{source}] {title}")
             print(f"     Company: {company}")
+            for result in job.get('radar_results', []):
+                print(
+                    f"     [{result.get('radar_label', '')}] "
+                    f"{result.get('score', 0)}/100 — {result.get('priority', '')}"
+                )
         if len(jobs) > 20:
             print(f"\n  ... and {len(jobs) - 20} more jobs")
     else:
@@ -993,7 +1146,11 @@ def print_dry_run_report(jobs: list[dict]):
     print("=" * 60 + "\n")
 
 # ============= MAIN =============
-async def main(dry_run: bool = False):
+async def main(
+    dry_run: bool = False,
+    show_history: bool = False,
+    set_status: Optional[list[str]] = None,
+):
     logger.info("=" * 50)
     logger.info("Job Monitor Bot Starting")
     if dry_run:
@@ -1004,6 +1161,37 @@ async def main(dry_run: bool = False):
     scraper = JobSiteScraper()
 
     try:
+        if show_history:
+            print_history(scraper)
+            return
+        if set_status:
+            if len(set_status) == 2:
+                job_id, status = set_status
+                radar_id = None
+            elif len(set_status) == 3:
+                job_id, radar_id, status = set_status
+            else:
+                raise ValueError(
+                    "Use --set-status JOB_ID RADAR STATUS; RADAR deve ser radar_a ou radar_b"
+                )
+            valid_statuses = {
+                'interessada', 'candidatura_enviada', 'entrevista', 'recusada', 'encerrada'
+            }
+            if radar_id is not None and radar_id not in {'radar_a', 'radar_b'}:
+                raise ValueError("RADAR deve ser radar_a ou radar_b")
+            if status not in valid_statuses:
+                raise ValueError(
+                    "Status inválido. Use: " + ", ".join(sorted(valid_statuses))
+                )
+            if not scraper.update_radar_tracking_status(job_id, radar_id, status):
+                raise ValueError(
+                    f"ID '{job_id}' ou radar não encontrado, ou ID ambíguo no histórico"
+                )
+            logger.info(
+                f"Updated opportunity {job_id[:12]} on {radar_id or 'single radar'} to '{status}'"
+            )
+            return
+
         start_time = datetime.now()
         new_jobs = await scraper.scrape_serper_search()
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -1014,14 +1202,49 @@ async def main(dry_run: bool = False):
         if dry_run:
             print_dry_run_report(new_jobs)
         else:
-            if new_jobs:
-                logger.info(f"Found {len(new_jobs)} new matching jobs")
-                notification_sent = await send_telegram_notification(new_jobs)
+            async def persist_delivered(opportunities: list[dict]):
+                scraper.mark_jobs_as_seen(opportunities)
+                if not scraper.save_seen_jobs():
+                    raise RuntimeError("Could not persist delivered opportunity status")
+
+            high_priority_jobs = [
+                job for job in new_jobs if job.get('is_high_priority')
+            ]
+            if high_priority_jobs:
+                logger.info(
+                    f"Found {len(high_priority_jobs)} high-priority opportunities"
+                )
+                notification_sent = await send_telegram_notification(
+                    high_priority_jobs,
+                    on_delivered=persist_delivered,
+                )
                 if not notification_sent:
-                    raise RuntimeError("Notification failed. Keeping jobs unseen for retry on next run.")
-                scraper.mark_jobs_as_seen([job.get('id', '') for job in new_jobs if job.get('id')])
+                    raise RuntimeError(
+                        "Notification failed. Delivered batches were saved; remaining jobs will retry."
+                    )
             else:
-                logger.info("No new matching jobs found")
+                logger.info("No high-priority opportunities found")
+
+            now_utc = datetime.now(timezone.utc)
+            digest_due = is_daily_digest_due(
+                now_utc,
+                scraper.last_digest_date,
+                os.getenv('GITHUB_EVENT_NAME', ''),
+                int(NOTIFICATIONS_CONFIG.get('heartbeat_hour_utc', 23)),
+                int(NOTIFICATIONS_CONFIG.get('heartbeat_minute_utc', 30)),
+            )
+            digest_jobs = scraper.get_pending_digest() if digest_due else []
+            if digest_jobs:
+                if not await send_telegram_notification(
+                    digest_jobs,
+                    daily_digest=True,
+                    on_delivered=persist_delivered,
+                ):
+                    raise RuntimeError(
+                        "Daily digest failed. Delivered batches were saved; remaining opportunities will retry."
+                    )
+            if digest_due:
+                scraper.last_digest_date = now_utc.date().isoformat()
 
             # Heartbeat / failure alert: separate from job notifications so silence
             # means "no new jobs", not "the bot broke". Failures never block the run.
@@ -1030,20 +1253,21 @@ async def main(dry_run: bool = False):
                 issues.append("SERPER_API_KEY missing — no jobs can be found")
             alert_on_failures = bool(NOTIFICATIONS_CONFIG.get('alert_on_failures', True))
             heartbeat_enabled = bool(NOTIFICATIONS_CONFIG.get('heartbeat_enabled', True))
-            heartbeat_hour = int(NOTIFICATIONS_CONFIG.get('heartbeat_hour_utc', 9))
             should_alert = bool(issues) and alert_on_failures
             should_heartbeat = (
                 heartbeat_enabled
                 and not should_alert
                 and not new_jobs
-                and datetime.now(timezone.utc).hour == heartbeat_hour
+                and not digest_jobs
+                and digest_due
             )
             if should_alert or should_heartbeat:
                 status_text = build_status_message(scraper.metrics, len(new_jobs), issues)
                 if not await send_telegram_status(status_text):
                     logger.warning("Failed to send status/heartbeat message")
 
-            scraper.save_seen_jobs()
+            if not scraper.save_seen_jobs():
+                raise RuntimeError("Could not persist opportunity history")
         
     except Exception as e:
         logger.error(f"Error in main: {e}")
@@ -1055,4 +1279,10 @@ async def main(dry_run: bool = False):
 
 if __name__ == "__main__":
     args = parse_args()
-    asyncio.run(main(dry_run=args.dry_run))
+    asyncio.run(
+        main(
+            dry_run=args.dry_run,
+            show_history=args.history,
+            set_status=args.set_status,
+        )
+    )

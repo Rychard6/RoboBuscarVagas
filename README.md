@@ -1,139 +1,70 @@
-# Job Monitor Bot
+# Monitor de vagas — dois radares independentes
 
-Automated job-search bot that searches Google (via [Serper.dev](https://serper.dev)) across job-board domains and sends Telegram notifications for new remote postings matching your keywords. Runs on GitHub Actions with zero infrastructure costs.
+Bot Python que pesquisa resultados públicos do Google por meio do Serper, valida vagas para dois perfis independentes e envia alertas pelo Telegram. O GitHub Actions executa a busca a cada quatro horas; não é necessário contratar infraestrutura ou adicionar outro serviço.
 
-## Features
+## Radares
 
-- **Google search via Serper.dev** — Real Google results across job-board domains using a single API key (no Google Cloud project or Custom Search Engine to set up)
-- **Combined-site queries** — One query per keyword spans all boards via `(site:a OR site:b …)`, so every run covers everything
-- **Location filtering** — Remote-first, with a visa/relocation exception for onsite/hybrid roles
-- **Duplicate detection** — Tracks seen jobs to avoid repeat notifications
-- **Telegram notifications** — Get instant alerts on your phone, plus a daily heartbeat and failure alerts
-- **GitHub Actions** — Runs automatically on a schedule (every 4 hours by default)
+- **Radar A — Segunda Renda:** CLT, PJ ou estágio; remoto, híbrido ou presencial. Trabalho remoto precisa indicar abrangência no Brasil; vagas híbridas/presenciais precisam indicar Brasília/DF ou uma localidade próxima configurada. Prioriza turno noturno, madrugada, overnight e escalas compatíveis.
+- **Radar B — Carreira em Tecnologia:** somente remoto e contrato PJ ou estágio. Aceita estágio, Júnior e Pleno; Sênior somente em função explicitamente Front-end. Vagas CLT, híbridas ou presenciais são rejeitadas antes da pontuação.
 
-## Quick Start
+Os dois radares precisam confirmar contrato e modalidade nos dados públicos encontrados. O Radar B também exige senioridade identificável. Sinais ausentes, negados, contraditórios ou ambíguos não viram elegibilidade por pontuação. Para vagas presenciais/híbridas, a localidade precisa estar ligada explicitamente ao local de trabalho; o Entorno não é incluído e Planaltina só é aceita quando identificada como DF. Compatibilidade técnica e potencial de carreira dependem de evidências na descrição. O horário não é inferido da data de publicação: quando não indicado, aparece como **“Horário não informado”**. Salário ausente aparece como **“Não divulgado”**.
 
-### 1. Fork this repository
+Pesos e limites de prioridade estão em `sites_config.yaml`. Consultas e fontes públicas estão em `google_search_sites.yaml`. Ajuste as listas de termos de acordo com o perfil; as regras de pontuação e validação ficam em `radar_logic.py`.
 
-### 2. Get a Serper API key
+## Configuração
 
-Sign up at [serper.dev](https://serper.dev) (free tier, ~2,500 one-time credits) and copy your API key. No Google Cloud project or Programmable Search Engine is needed — Serper queries Google directly.
+Adicione estes secrets em **Settings → Secrets and variables → Actions**:
 
-### 3. Set up GitHub Secrets
+| Secret | Obrigatório | Descrição |
+|---|---:|---|
+| `SERPER_API_KEY` | Sim | Chave do Serper.dev |
+| `TELEGRAM_BOT_TOKEN` | Sim | Token do bot criado com @BotFather |
+| `TELEGRAM_CHAT_ID` | Sim | Chat que receberá as mensagens |
 
-Go to **Settings → Secrets and variables → Actions** and add:
+As consultas definem português (`pt-br`) e Brasil (`br`) como idioma e viés de busca. Isso orienta o Google, mas **não comprova** que a vaga seja elegível; a validação é feita separadamente pelo conteúdo do resultado.
 
-| Secret               | Required | Description                                                          |
-| -------------------- | -------- | -------------------------------------------------------------------- |
-| `TELEGRAM_BOT_TOKEN` | ✅       | Your Telegram bot token from [@BotFather](https://t.me/BotFather)    |
-| `TELEGRAM_CHAT_ID`   | ✅       | Your Telegram chat ID (use [@userinfobot](https://t.me/userinfobot)) |
-| `SERPER_API_KEY`     | ✅       | API key from [serper.dev](https://serper.dev)                        |
+## Execução local
 
-Keywords and target job boards are configured in `google_search_sites.yaml` (not a secret).
-
-### 4. Enable GitHub Actions
-
-The workflow runs automatically every 4 hours. You can also trigger it manually from the **Actions** tab.
-
-## Local Development
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-
-export TELEGRAM_BOT_TOKEN="your_token"
-export TELEGRAM_CHAT_ID="your_chat_id"
-export SERPER_API_KEY="your_serper_key"
-
-# Dry run: search but don't send notifications or update seen_jobs.json
+$env:SERPER_API_KEY = "sua-chave"
+$env:TELEGRAM_BOT_TOKEN = "seu-token"
+$env:TELEGRAM_CHAT_ID = "seu-chat-id"
 python job_monitor.py --dry-run
 ```
 
-## Configuration
+`--dry-run` pesquisa e mostra resultados sem enviar mensagens nem persistir alterações no histórico.
 
-### `google_search_sites.yaml` — what to search for
+## Histórico e status
 
-```yaml
-settings:
-  enabled: true
-  max_results_per_query: 10
-  serper_time_filter: "qdr:d" # past day; qdr:h/d/w/m/y or "" for none
-  serper_country: "us"
-  query_negative_terms: ["onsite", "hybrid"]
+O histórico mantém a URL canônica, fontes, publicação, pontuação e status de entrega por radar; a mesma URL encontrada em várias consultas/fontes é agrupada em uma única notificação. IDs de vagas anteriores no formato legado continuam sendo reconhecidos.
 
-# Each keyword becomes ONE combined query across all sites below.
-keywords:
-  - '"React Native"'
-  - '("iOS Developer" OR "iOS Engineer" OR Swift)'
-  - '("Mobile Developer" OR "Mobile Engineer")'
+Status de acompanhamento disponíveis: `interessada`, `candidatura_enviada`, `entrevista`, `recusada` e `encerrada`.
 
-sites:
-  - domain: "greenhouse.io"
-    name: "Greenhouse"
-  - domain: "lever.co"
-    name: "Lever"
+```powershell
+python job_monitor.py --history
+python job_monitor.py --set-status ID_DA_VAGA radar_a entrevista
 ```
 
-Searches/day = `#keywords × runs/day`. At 3 keywords and 6 runs/day that's ~18 — comfortably within Serper's free tier (~2,500 credits ≈ 20 weeks).
+O ID curto é incluído na notificação. Atualize um radar por vez (`radar_a` ou `radar_b`); registros legados com status global são migrados para os radares existentes sem sobrescrever status individuais já gravados. O histórico mantém a trilha de alterações de status separadamente para cada radar. No GitHub Actions, execute manualmente o workflow e escolha **history** para listar o histórico ou **set-status** para atualizar um status.
 
-### `sites_config.yaml` — filtering, alerts, runtime tuning
+O histórico continua no cache gratuito do GitHub Actions, não em armazenamento durável. O cache é imutável, limitado por escopo de branch e pode expirar ou ser removido pelo GitHub; portanto, perda de cache pode causar notificações repetidas e perda do histórico/status. As chaves incluem o número da tentativa (`run_attempt`) e cada execução restaura pelo prefixo para evitar que um rerun reutilize uma chave de gravação imutável. Isso reduz colisões, mas não elimina perdas do cache nem oferece garantias de transação/backup. A opção **history** mostra o estado restaurado no Actions; a execução local mostra o `seen_jobs.json` disponível naquela cópia.
 
-Holds the `location_filter` (remote policy + an always-on `exclude_location_terms` list that drops results whose title/snippet mentions a given country/city as a whole word — e.g. India), `notifications` (heartbeat + failure alerts), and `request` (HTTP timeouts/retries, seen-jobs retention) sections.
+## Notificações e cadência
 
-## CLI Options
+- Vagas de alta prioridade (80–100) são notificadas logo após a busca.
+- Média (60–79) e baixa (abaixo de 60) ficam pendentes para o resumo diário.
+- O resumo diário e o heartbeat são programados para **23:30 UTC (20:30 em Brasília)**. O estado persiste a data do último resumo para impedir repetição no mesmo dia; a execução manual não envia o resumo diário.
+- Cada mensagem inclui radar, pontuação/prioridade, contrato, modalidade, localidade, turno, salário, tecnologias, requisitos, compatibilidade, pontos de atenção, data, status e link original.
 
-| Flag        | Description                                                          |
-| ----------- | -------------------------------------------------------------------- |
-| `--dry-run` | Search but don't send notifications or update `seen_jobs.json`       |
+Há seis grupos de busca por execução, com até 10 resultados por consulta. O cron roda a cada quatro horas (`30 3,7,11,15,19,23 * * *`), aproximadamente 36 créditos Serper/dia antes de execuções manuais. O resumo é enviado somente na execução de 23:30 UTC, sem uma busca adicional. O saldo gratuito do Serper é limitado; reduza grupos ou frequência se necessário. Nenhum scraping autenticado, CAPTCHA ou endpoint privado é utilizado.
 
-## How It Works
+## Testes
 
-1. **Load seen jobs** from `seen_jobs.json`
-2. **Search** — one combined `(site:… OR …)` Google query per keyword via Serper
-3. **Filter** by location policy (remote-first, with a visa/relocation exception)
-4. **Deduplicate** using job IDs (skips already-seen and in-run duplicates)
-5. **Send Telegram notification** with retries
-6. **Persist seen jobs** only after a successful notification, saved to the GitHub Actions cache (restored on the next run)
-
-## Adding Job Boards
-
-Add a domain to the `sites:` list in `google_search_sites.yaml`:
-
-```yaml
-sites:
-  - domain: "newsite.com"
-    name: "New Site"
+```powershell
+python -m unittest -v
 ```
 
-It's automatically folded into each keyword's combined query — no other setup needed.
-
-## Cadence & Latency
-
-Because every run covers all keywords and boards, your worst-case alert latency equals the schedule interval. Change the `cron` in `.github/workflows/job-monitor.yml`:
-
-```yaml
-- cron: "0 */4 * * *" # every 4 hours (default)
-```
-
-More frequent = fresher alerts but more Serper credits; less frequent stretches the free tier.
-
-## Troubleshooting
-
-### Jobs not showing up?
-
-- Run `python job_monitor.py --dry-run` locally with `SERPER_API_KEY` set.
-- Check the GitHub Actions logs — the `google_last_error` line in **Operational Metrics** reports the exact Serper error, and failures are also pushed to Telegram.
-- Broaden or adjust the `keywords` in `google_search_sites.yaml`.
-
-### Out of Serper credits?
-
-You'll get a Telegram failure alert (rate-limit/quota). Lower the cron frequency, trim keywords, or upgrade your Serper plan.
-
-### Duplicate notifications?
-
-- Dedup state lives in the Actions cache (`seen-jobs-*`). If the cache is evicted (rare — it's accessed every run), you may get a one-time repeat batch. Check the "Restore/Save seen jobs" steps in the Actions logs.
-
-## License
-
-MIT
+Os testes cobrem regras obrigatórias, pontuação/prioridade, horários não inferidos, migração do estado legado, deduplicação entre radares e atualização de status.

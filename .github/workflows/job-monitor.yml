@@ -5,11 +5,44 @@ name: Job Monitor Bot
 
 on:
   schedule:
-    # Run every 4 hours at minute 0 (00:00, 04:00, 08:00, etc.)
-    # With combined-site Serper queries, this is also the worst-case alert latency.
-    - cron: "0 */4 * * *"
+    # Run every 4 hours; 23:30 UTC is 20:30 in Brasília.
+    # All configured query groups run each cycle; this is the worst-case alert latency.
+    - cron: "30 3,7,11,15,19,23 * * *"
 
-  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Search, list the saved opportunity history, or update an opportunity status"
+        required: true
+        type: choice
+        options:
+          - search
+          - history
+          - set-status
+        default: search
+      job_id:
+        description: "Opportunity ID (the 12-character ID shown in Telegram), for set-status"
+        required: false
+        type: string
+      radar:
+        description: "Radar whose tracking status should change"
+        required: false
+        type: choice
+        options:
+          - radar_a
+          - radar_b
+        default: radar_a
+      status:
+        description: "New opportunity tracking status"
+        required: false
+        type: choice
+        options:
+          - interessada
+          - candidatura_enviada
+          - entrevista
+          - recusada
+          - encerrada
+        default: interessada
 
 concurrency:
   group: job-monitor-${{ github.ref }}
@@ -44,18 +77,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Dedup state (the "seen" job IDs) lives in the Actions cache, not the repo — so the
-      # bot no longer commits seen_jobs.json on every run. Restore the most recent cache via
-      # the restore-keys prefix; save under a unique per-run key (cache keys are immutable).
-      - name: Restore seen jobs
+      # Dedup IDs and opportunity history live in the Actions cache, not repository commits.
+      # Include run_attempt because cache keys are immutable and reruns need a fresh save key.
+      - name: Restore opportunity history
         uses: actions/cache/restore@v4
         with:
           path: seen_jobs.json
-          key: seen-jobs-${{ github.run_id }}
+          key: seen-jobs-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             seen-jobs-
 
-      - name: Ensure seen_jobs.json exists
+      - name: Ensure history state exists
         run: '[ -f seen_jobs.json ] || echo "{}" > seen_jobs.json'
 
       - name: Run job search
@@ -63,18 +95,22 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          MONITOR_COMMAND: ${{ inputs.command }}
+          OPPORTUNITY_ID: ${{ inputs.job_id }}
+          OPPORTUNITY_RADAR: ${{ inputs.radar }}
+          OPPORTUNITY_STATUS: ${{ inputs.status }}
         run: |
-          python job_monitor.py
+          if [ "$MONITOR_COMMAND" = "history" ]; then
+            python job_monitor.py --history
+          elif [ "$MONITOR_COMMAND" = "set-status" ]; then
+            python job_monitor.py --set-status "$OPPORTUNITY_ID" "$OPPORTUNITY_RADAR" "$OPPORTUNITY_STATUS"
+          else
+            python job_monitor.py
+          fi
 
       - name: Save seen jobs
         if: always()
         uses: actions/cache/save@v4
         with:
           path: seen_jobs.json
-          key: seen-jobs-${{ github.run_id }}
-
-# ---------------------------------------------------------------------------
-# Alternative schedules (replace the cron above):
-#   every 2h: '0 */2 * * *'   every 6h: '0 */6 * * *'   daily 9am UTC: '0 9 * * *'
-# If you change the interval, update notifications.heartbeat_hour_utc in
-# sites_config.yaml to an hour the schedule actually runs.
+          key: seen-jobs-${{ github.run_id }}-${{ github.run_attempt }}

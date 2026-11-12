@@ -1,66 +1,61 @@
-# Serper.dev search configuration — what the bot searches Google for.
+# Serper.dev searches public Google results with Brazilian Portuguese queries.
 #
-# How it works:
-#   - Each entry under 'keywords' becomes ONE combined query across all 'sites' via
-#     (site:a OR site:b ...), e.g.:
-#       "React Native" remote (site:greenhouse.io OR site:lever.co OR ...) -onsite -hybrid
-#   - Requires the SERPER_API_KEY secret (get a free key at https://serper.dev).
+# Search is discovery only. Mandatory contract, location, modality, and seniority
+# checks are applied to each result before scoring or notification.
 
 settings:
   enabled: true
-  # Results per query. ≤10 costs 1 Serper credit; >10 costs a flat 2 (up to 100). 10 is
-  # plenty here — fresh postings per keyword in the time window are rarely more than 10.
   max_results_per_query: 10
   min_seconds_between_queries: 2.0
-  # Tolerate a few transient (non-rate-limit) failures before aborting the run.
   max_consecutive_failures: 3
-  # Terms excluded from every query (e.g. ["onsite", "hybrid"]). Empty = no exclusions,
-  # so onsite/hybrid roles are returned too (you filter by opening the link yourself).
   query_negative_terms: []
-
-  # Serper does NOT rotate: every run fires one combined query per keyword across ALL
-  # boards, so worst-case alert latency == the workflow cron interval (currently 4h).
-  # Credits/run = #keywords × (1 if max_results<=10 else 2) × max(1, #countries).
-  # Here: 3 × 1 (num=10) × 1 = 3/run → ~18/day → ~20 weeks on the free ~2,500 credits.
-  serper_time_filter: "qdr:d"        # qdr:h/d/w/m/y = past hour/day/week/month/year ("" = no filter)
-  # Country ranking bias (Google "gl"). One request runs PER (keyword, country), so total
-  # searches/run = #keywords × #countries. [] = a single unbiased search — a good default,
-  # since at typical low daily volume the top-10 already captures everything. To expand by
-  # region (only useful if a keyword exceeds 10 fresh results), list ISO codes, e.g.
-  # ["us", "gb", "ca", "de", "nl"] — note each country multiplies credits.
-  serper_countries: []
+  serper_language: "pt-br"
+  serper_countries: ["br"]
+  # 6 requests/run × 6 runs/day ~= 36 Serper credits/day with the current workflow.
+  serper_time_filter: "qdr:d"
   serper_max_retries_per_query: 2
   serper_stop_on_rate_limit: true
 
-# Keywords to search for. Each becomes one combined-site query. Use quotes for exact
-# phrases; ("A" OR "B") groups variants into a single query (one credit).
-keywords:
-  - '"React Native"'
-  - '("iOS Developer" OR "iOS Engineer" OR Swift)'
-  - '("Mobile Developer" OR "Mobile Engineer")'
+# Three independent search groups per radar keep a broad but manageable search budget.
+# Do not add shift/contract/modality exclusions here; each radar validates these separately.
+queries:
+  radar_a:
+    - '("suporte técnico" OR "help desk" OR "service desk" OR NOC OR "monitoramento de sistemas" OR "operador de sistemas") (vaga OR emprego)'
+    - '("back office" OR "auxiliar administrativo" OR "assistente de operações" OR digitador OR "processamento de dados" OR "cadastro de dados") (vaga OR emprego)'
+    - '(Angular OR React OR Next.js OR JavaScript OR TypeScript OR Node.js OR NestJS OR Java OR Python OR COBOL OR Azure OR "Power BI") (desenvolvedor OR infraestrutura OR sistemas) vaga'
+  radar_b:
+    - '("desenvolvedor front-end" OR "desenvolvedor back-end" OR "full stack" OR "engenharia de software") (Angular OR React OR Next.js OR JavaScript OR TypeScript OR Node.js OR NestJS OR Java OR Python OR COBOL OR "Power BI")'
+    - '(suporte OR NOC OR DevOps OR "cloud computing" OR "Microsoft Azure" OR infraestrutura OR "service desk") (júnior OR pleno OR remoto)'
+    - '(estágio OR estagiário OR estagiária) (TI OR tecnologia OR desenvolvimento OR informática) remoto'
 
-# Job board sites. Serper folds these into one combined query per keyword:
-#   {keyword} remote (site:greenhouse.io OR site:lever.co OR ...) -onsite -hybrid
-# Keep this list and your search engine in sync if you add domains.
+# Google search domain restrictions. Results are public search listings; the bot does not
+# authenticate to job boards or access their private endpoints.
 sites:
-  # ===== ATS Platforms =====
   - domain: "greenhouse.io"
     name: "Greenhouse"
-
   - domain: "ashbyhq.com"
     name: "Ashby"
-
   - domain: "lever.co"
     name: "Lever"
-
   - domain: "jobs.workable.com"
     name: "Workable"
-
   - domain: "wellfound.com"
     name: "Wellfound"
-
   - domain: "recruitee.com"
     name: "Recruitee"
-
   - domain: "applytojob.com"
     name: "ApplyToJob"
+  - domain: "gupy.io"
+    name: "Gupy"
+  - domain: "vagas.com.br"
+    name: "Vagas.com.br"
+  - domain: "infojobs.com.br"
+    name: "InfoJobs"
+  - domain: "indeed.com.br"
+    name: "Indeed Brasil"
+  - domain: "programathor.com.br"
+    name: "Programathor"
+  - domain: "geekhunter.com.br"
+    name: "GeekHunter"
+  - domain: "linkedin.com/jobs"
+    name: "LinkedIn Jobs"

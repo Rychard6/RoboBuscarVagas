@@ -1,53 +1,138 @@
-# Job Monitor runtime configuration: result filtering, notifications, and HTTP tuning.
-# (What the bot searches for is configured in google_search_sites.yaml — the Serper search.)
+# Job Monitor runtime configuration: radar eligibility/scoring, notifications, and HTTP tuning.
+# Search groups and public job-board domains are configured in google_search_sites.yaml.
+# Required signals are deliberately conservative: unknown contract, modality, or level
+# does not become eligible merely because the role scored well.
+radars:
+  priority_thresholds:
+    high: 80
+    medium: 60
 
-# Location filtering for final alert eligibility.
-# remote/onsite/hybrid filtering is DISABLED (mode "off") — every matching result is sent;
-# you open the link and decide. To re-enable remote-first filtering (with a visa/relocation
-# exception), set the mode to "strict_remote_with_exception" (the remote/hybrid/onsite/
-# exception term lists below are only used in that mode).
-location_filter:
-  location_filter_mode: "off"
-  accept_unspecified_location: true
-  # Always-on regional exclude (works regardless of the mode above): drop any result whose
-  # title or snippet mentions one of these as a WHOLE WORD. Add countries/cities to taste.
-  exclude_location_terms:
-    - "india"
-    - "bengaluru"
-    - "bangalore"
-    - "mumbai"
-    - "delhi"
-    - "hyderabad"
-    - "pune"
-    - "chennai"
-    - "gurgaon"
-    - "gurugram"
-    - "noida"
-    - "kolkata"
-    - "ahmedabad"
-  location_remote_terms:
-    - "remote"
-    - "work from home"
-    - "wfh"
-    - "distributed"
-    - "anywhere"
-  location_hybrid_terms:
-    - "hybrid"
-    - "2 days onsite"
-    - "3 days onsite"
-    - "partially remote"
-  location_onsite_terms:
-    - "onsite"
-    - "on-site"
-    - "in office"
-    - "office based"
-    - "on site"
-  location_exception_terms:
-    - "visa sponsorship"
-    - "sponsorship available"
-    - "relocation support"
-    - "willing to relocate"
-    - "relocation assistance"
+  profile:
+    experience_terms:
+      ["consultoria", "ambiente corporativo", "projetos corporativos", "grandes empresas",
+       "instituição financeira", "serviços financeiros", "banco do brasil"]
+    education_terms:
+      ["engenharia de computação", "engenharia da computação", "computer engineering"]
+    research_terms:
+      ["RAG", "retrieval augmented generation", "inteligência artificial", "IA generativa"]
+
+  signals:
+    contracts:
+      clt: ["CLT", "carteira assinada", "regime celetista"]
+      pj: ["PJ", "pessoa jurídica", "prestação de serviços", "contrato PJ"]
+      internship: ["estágio", "estagiário", "estagiária", "contrato de estágio"]
+    modalities:
+      remote: ["remoto", "remota", "remote", "100% remoto", "home office", "trabalho remoto"]
+      hybrid: ["híbrido", "híbrida", "hybrid", "modelo híbrido"]
+      onsite: ["presencial", "on-site", "in loco"]
+    seniority:
+      internship: ["estágio", "estagiário", "estagiária", "intern"]
+      junior: ["júnior", "junior", "jr"]
+      mid: ["pleno", "mid-level", "mid level"]
+      senior: ["sênior", "senior", "sr"]
+    senior_frontend_titles:
+      ["front-end", "frontend", "front end", "desenvolvedor front-end", "frontend developer",
+       "angular developer", "desenvolvedor angular", "react developer", "desenvolvedor react",
+       "next.js developer", "desenvolvedor next.js"]
+    role_areas:
+      support:
+        ["help desk", "service desk", "suporte técnico", "suporte de ti", "suporte de aplicações",
+         "atendimento técnico", "analista de suporte", "analista suporte", "técnico de informática"]
+      operations:
+        ["noc", "monitoramento de sistemas", "monitoramento de infraestrutura", "operador de sistemas",
+         "operador de computador", "operações de ti", "assistente de operações", "infraestrutura"]
+      administration:
+        ["back office", "auxiliar administrativo", "assistente administrativo", "digitador",
+         "cadastro de dados", "processamento de dados", "operador de dados", "atendimento digital",
+         "atendimento realizado por computador", "atendimento por computador"]
+      frontend:
+        ["front-end", "frontend", "front end", "desenvolvedor front-end", "frontend developer",
+         "desenvolvedor web", "angular", "react", "next.js", "angular developer",
+         "desenvolvedor angular", "react developer", "desenvolvedor react",
+         "next.js developer", "desenvolvedor next.js", "javascript developer",
+         "desenvolvedor javascript", "typescript developer", "desenvolvedor typescript"]
+      backend:
+        ["back-end", "backend", "back end", "node.js", "nestjs", "desenvolvedor de software",
+         "desenvolvedor backend", "desenvolvedor back-end", "java developer",
+         "desenvolvedor java", "python developer", "desenvolvedor python",
+         "cobol developer", "desenvolvedor cobol"]
+      fullstack:
+        ["full stack", "fullstack", "full-stack", "engenharia de software", "software engineer"]
+      infrastructure:
+        ["devops", "cloud", "cloud computing", "azure", "infraestrutura", "sistemas", "engenheiro de sistemas"]
+      it_general:
+        ["tecnologia da informação", "tecnologia", "informática", "desenvolvimento", "ti"]
+    technologies:
+      ["Angular", "React", "Next.js", "JavaScript", "TypeScript", "Node.js", "NestJS", "Java",
+       "Python", "COBOL", "Microsoft Azure", "Azure", "cloud computing", "infraestrutura",
+       "APIs", "microsserviços", "microservices", "SQL", "DevOps", "Power BI", "RAG"]
+    locations:
+      brazil: ["Brasil", "Brazil", "em todo o território nacional", "em todo o país"]
+      brasilia_region:
+        ["Brasília", "Distrito Federal", "DF", "Taguatinga", "Ceilândia", "Águas Claras",
+         "Gama", "Sobradinho", "Planaltina-DF", "Samambaia", "Guará", "Lago Sul", "Lago Norte",
+         "Núcleo Bandeirante"]
+    night_shifts:
+      ["noturno", "noturna", "madrugada", "overnight", "turno da noite", "turno noturno",
+       "plantão noturno", "plantão de madrugada"]
+    other_off_hours:
+      ["12x36", "escala 12x36", "escala noturna", "fora do horário comercial",
+       "turnos alternados", "escala de revezamento"]
+    radar_a_incompatible_titles:
+      ["analista sênior de segurança da informação", "analista de segurança da informação sênior",
+       "engenheiro de dados sênior", "engenheiro de dados avançado", "senior data engineer",
+       "data engineer senior", "cientista de dados sênior", "machine learning engineer",
+       "especialista em cibersegurança", "arquiteto de dados", "principal engineer", "staff engineer"]
+    activity_evidence:
+      support:
+        ["atendimento de chamados", "atendimento a usuários", "suporte a usuários",
+         "resolução de incidentes", "troubleshooting", "help desk", "service desk",
+         "suporte técnico"]
+      operations:
+        ["monitoramento de sistemas", "monitoramento de infraestrutura", "operação de sistemas",
+         "análise de alertas", "acompanhamento de ambientes"]
+      administration:
+        ["cadastro de dados", "digitação", "conferência de informações", "processamento de dados",
+         "back office"]
+      frontend:
+        ["desenvolvimento de interfaces", "desenvolvimento front-end", "criação de componentes",
+         "manutenção de aplicações web"]
+      backend:
+        ["desenvolvimento de APIs", "desenvolvimento back-end", "integração de sistemas",
+         "manutenção de serviços"]
+      fullstack:
+        ["desenvolvimento de software", "desenvolvimento de aplicações", "engenharia de software"]
+      infrastructure:
+        ["administração de infraestrutura", "administração de ambientes em nuvem",
+         "gestão de servidores", "automação de infraestrutura", "cloud computing"]
+    career_growth_evidence:
+      ["plano de desenvolvimento", "trilha de carreira", "mentoria", "capacitação",
+       "treinamento", "desenvolvimento profissional", "possibilidade de crescimento",
+       "programa de formação"]
+
+  radars:
+    radar_a:
+      label: "RADAR A — SEGUNDA RENDA"
+      allowed_contracts: ["clt", "pj", "internship"]
+      allowed_modalities: ["remote", "hybrid", "onsite"]
+      weights:
+        night_shift: 0.30
+        activities: 0.30
+        experience: 0.20
+        contract_and_modality: 0.10
+        compensation: 0.10
+    radar_b:
+      label: "RADAR B — CARREIRA EM TECNOLOGIA"
+      allowed_contracts: ["pj", "internship"]
+      allowed_modalities: ["remote"]
+      allowed_seniority: ["internship", "junior", "mid", "senior"]
+      internship_areas: ["support", "operations", "administration", "frontend", "backend", "fullstack", "infrastructure", "it_general"]
+      weights:
+        technical: 0.35
+        seniority: 0.25
+        contract: 0.20
+        remote: 0.10
+        career_growth: 0.10
 
 # Heartbeat / failure alerts so silence means "no new jobs", not "the bot broke".
 notifications:
@@ -56,9 +141,9 @@ notifications:
   alert_on_failures: true
   # Send a daily "still alive" status summary even when there are 0 new jobs.
   heartbeat_enabled: true
-  # Which run hour (UTC) sends the daily heartbeat. The workflow runs every 4h
-  # (00,04,08,12,16,20), so this must be one of those hours to fire on schedule.
-  heartbeat_hour_utc: 8
+  # Daily summary/heartbeat runs at 23:30 UTC (20:30 in Brasília).
+  heartbeat_hour_utc: 23
+  heartbeat_minute_utc: 30
 
 # Global runtime tuning for HTTP behavior and seen-jobs retention.
 request:
@@ -73,3 +158,5 @@ request:
   telegram_max_retries: 3
   telegram_retry_base_delay: 1.0
   telegram_retry_max_delay: 10.0
+  # Maximum number of opportunities retained for history/status tracking.
+  job_history_max: 5000
