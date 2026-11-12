@@ -1,7 +1,7 @@
 # Job Monitor runtime configuration: radar eligibility/scoring, notifications, and HTTP tuning.
 # Search groups and public job-board domains are configured in google_search_sites.yaml.
-# Required signals are deliberately conservative: unknown contract, modality, or level
-# does not become eligible merely because the role scored well.
+# Explicitly incompatible signals are rejected; missing signals remain pending
+# confirmation instead of being treated as negative evidence.
 radars:
   priority_thresholds:
     high: 80
@@ -20,13 +20,13 @@ radars:
     contracts:
       clt: ["CLT", "carteira assinada", "regime celetista"]
       pj: ["PJ", "pessoa jurídica", "prestação de serviços", "contrato PJ"]
-      internship: ["estágio", "estagiário", "estagiária", "contrato de estágio"]
+      internship: ["estágio", "estagiário", "estagiária", "contrato de estágio", "internship", "intern"]
     modalities:
       remote: ["remoto", "remota", "remote", "100% remoto", "home office", "trabalho remoto"]
       hybrid: ["híbrido", "híbrida", "hybrid", "modelo híbrido"]
       onsite: ["presencial", "on-site", "in loco"]
     seniority:
-      internship: ["estágio", "estagiário", "estagiária", "intern"]
+      internship: ["estágio", "estagiário", "estagiária", "internship", "intern"]
       junior: ["júnior", "junior", "jr"]
       mid: ["pleno", "mid-level", "mid level"]
       senior: ["sênior", "senior", "sr"]
@@ -37,7 +37,8 @@ radars:
     role_areas:
       support:
         ["help desk", "service desk", "suporte técnico", "suporte de ti", "suporte de aplicações",
-         "atendimento técnico", "analista de suporte", "analista suporte", "técnico de informática"]
+         "atendimento técnico", "analista de suporte", "analista suporte", "técnico de suporte",
+         "técnico de informática"]
       operations:
         ["noc", "monitoramento de sistemas", "monitoramento de infraestrutura", "operador de sistemas",
          "operador de computador", "operações de ti", "assistente de operações", "infraestrutura"]
@@ -60,6 +61,8 @@ radars:
         ["full stack", "fullstack", "full-stack", "engenharia de software", "software engineer"]
       infrastructure:
         ["devops", "cloud", "cloud computing", "azure", "infraestrutura", "sistemas", "engenheiro de sistemas"]
+      security:
+        ["segurança da informação", "cibersegurança", "cybersecurity", "information security"]
       it_general:
         ["tecnologia da informação", "tecnologia", "informática", "desenvolvimento", "ti"]
     technologies:
@@ -73,8 +76,15 @@ radars:
          "Gama", "Sobradinho", "Planaltina-DF", "Samambaia", "Guará", "Lago Sul", "Lago Norte",
          "Núcleo Bandeirante"]
     night_shifts:
-      ["noturno", "noturna", "madrugada", "overnight", "turno da noite", "turno noturno",
+      ["noturno", "noturna", "noite", "madrugada", "overnight", "overnight shift",
+       "graveyard", "graveyard shift", "night shift", "turno da noite", "turno noturno",
        "plantão noturno", "plantão de madrugada"]
+    business_hours:
+      ["horário comercial", "horario de expediente", "business hours", "day shift",
+       "turno diurno", "período diurno"]
+    mixed_shifts:
+      ["turnos diurnos e noturnos", "turno diurno e noturno", "horário diurno e noturno",
+       "horario diurno e noturno", "turnos mistos", "horário misto", "horario misto"]
     other_off_hours:
       ["12x36", "escala 12x36", "escala noturna", "fora do horário comercial",
        "turnos alternados", "escala de revezamento"]
@@ -105,6 +115,8 @@ radars:
       infrastructure:
         ["administração de infraestrutura", "administração de ambientes em nuvem",
          "gestão de servidores", "automação de infraestrutura", "cloud computing"]
+      security:
+        ["segurança da informação", "cibersegurança", "cybersecurity", "information security"]
     career_growth_evidence:
       ["plano de desenvolvimento", "trilha de carreira", "mentoria", "capacitação",
        "treinamento", "desenvolvimento profissional", "possibilidade de crescimento",
@@ -115,24 +127,26 @@ radars:
       label: "RADAR A — SEGUNDA RENDA"
       allowed_contracts: ["clt", "pj", "internship"]
       allowed_modalities: ["remote", "hybrid", "onsite"]
-      weights:
-        night_shift: 0.30
-        activities: 0.30
-        experience: 0.20
-        contract_and_modality: 0.10
-        compensation: 0.10
+      allowed_areas: ["support", "operations", "frontend", "backend", "fullstack", "infrastructure", "security", "it_general"]
+      schedule_scores:
+        night_confirmed: 95
+        mixed: 75
+        unknown: 65
+        business_hours: 45
+      priority_thresholds:
+        very_high: 90
+        high: 80
+        medium: 60
     radar_b:
       label: "RADAR B — CARREIRA EM TECNOLOGIA"
       allowed_contracts: ["pj", "internship"]
       allowed_modalities: ["remote"]
       allowed_seniority: ["internship", "junior", "mid", "senior"]
-      internship_areas: ["support", "operations", "administration", "frontend", "backend", "fullstack", "infrastructure", "it_general"]
-      weights:
-        technical: 0.35
-        seniority: 0.25
-        contract: 0.20
-        remote: 0.10
-        career_growth: 0.10
+      allowed_areas: ["support", "operations", "frontend", "backend", "fullstack", "infrastructure", "security", "it_general"]
+      internship_areas: ["support", "operations", "frontend", "backend", "fullstack", "infrastructure", "security", "it_general"]
+      base_score: 80
+      business_hours_bonus: 5
+      career_growth_bonus: 5
 
 # Heartbeat / failure alerts so silence means "no new jobs", not "the bot broke".
 notifications:

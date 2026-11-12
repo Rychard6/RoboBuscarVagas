@@ -137,6 +137,97 @@ def _has_unconfirmed_work_location(text: str, allowed_locations: list[str]) -> b
     return False
 
 
+def _unknown_work_location(text: str) -> bool:
+    unknown_terms = [
+        "a definir",
+        "a combinar",
+        "a confirmar",
+        "localidade não informada",
+        "local não informado",
+        "localidade não divulgada",
+        "local não divulgado",
+        "to be determined",
+        "tbd",
+        "unidade a definir",
+    ]
+    normalized = normalize_text(text)
+    return any(
+        matching_terms(normalized[match.end():match.end() + 120], unknown_terms)
+        for match in _WORK_LOCATION_CONTEXT.finditer(normalized)
+    )
+
+
+def _has_explicit_outside_work_location(
+    text: str, allowed_locations: list[str]
+) -> bool:
+    normalized = normalize_text(text)
+    unknown_terms = [
+        "a definir",
+        "a combinar",
+        "a confirmar",
+        "localidade não informada",
+        "local não informado",
+        "localidade não divulgada",
+        "local não divulgado",
+        "to be determined",
+        "tbd",
+        "unidade a definir",
+        "uma das unidades",
+    ]
+    generic_location_prefixes = {
+        "",
+        "local",
+        "localidade",
+        "local de trabalho",
+        "localidade de trabalho",
+        "unidade",
+        "uma das unidades",
+        "em local",
+        "no local",
+    }
+    for context_match in _WORK_LOCATION_CONTEXT.finditer(normalized):
+        tail = normalized[context_match.end():]
+        for location in allowed_locations:
+            location_match = re.match(
+                _location_pattern(normalize_text(location))
+                + r"(?=\b|[,.;)]|$)",
+                tail,
+            )
+            if not location_match:
+                continue
+            alternative_location = bool(
+                re.match(
+                    r"\s+(?:ou|e)\s+[a-z][a-z-]+|\s*/\s*[a-z]{2}\b",
+                    tail[location_match.end():],
+                )
+            )
+            if alternative_location or _is_negated_span(
+                normalized,
+                context_match.start(),
+                context_match.end() + location_match.end(),
+            ):
+                return True
+            break
+        else:
+            if not context_match.group("connector"):
+                continue
+            segment = re.split(r"[.;\n]", tail, maxsplit=1)[0]
+            unresolved = next(
+                (
+                    match
+                    for term in unknown_terms
+                    for match in _term_matches(segment, term)
+                ),
+                None,
+            )
+            if unresolved:
+                prefix = segment[:unresolved.start()].strip(" ,:-")
+                if prefix in generic_location_prefixes:
+                    continue
+            return True
+    return False
+
+
 def _remote_brazil_confirmed(
     text: str, remote_terms: list[str], brazil_terms: list[str]
 ) -> bool:
@@ -153,11 +244,29 @@ def _remote_brazil_confirmed(
                         continue
                     connector = normalized[remote_match.end():brazil_match.start()]
                     if len(connector) <= 35 and re.fullmatch(
-                        r"[\s,:-]*(?:(?:em|no|na|para|por|todo|toda|o|a|territorio|nacional)\s+)*",
+                        r"[\s,:-]*(?:(?:em|no|na|para|por|todo|toda|o|a|do|da|dos|"
+                        r"das|territorio|nacional|candidatos?|candidatas?|qualquer|"
+                        r"regiao|estado|lugar|brasileiro|brasileira|anywhere|in)\s+)*",
                         connector,
                     ):
                         return True
-    return False
+    brazil_wide_scope = [
+        "qualquer região do Brasil",
+        "qualquer estado do Brasil",
+        "qualquer lugar do Brasil",
+        "candidatos de qualquer região do Brasil",
+        "candidatos de qualquer estado brasileiro",
+        "qualquer região brasileira",
+        "Brasil inteiro",
+        "abrangência nacional",
+        "todo o território nacional",
+        "todo território brasileiro",
+        "anywhere in Brazil",
+    ]
+    return bool(
+        matching_terms(normalized, remote_terms)
+        and matching_terms(normalized, brazil_wide_scope)
+    )
 
 
 def matching_terms(text: str, terms: list[str]) -> list[str]:
@@ -172,8 +281,68 @@ def _matched_groups(text: str, groups: dict[str, list[str]]) -> list[str]:
     ]
 
 
-def _priority(score: int, config: dict[str, Any]) -> str:
-    thresholds = config.get("priority_thresholds", {})
+def _schedule_classification(
+    text: str, signals: dict[str, Any]
+) -> tuple[str, bool]:
+    normalized = normalize_text(text)
+    night_terms = signals.get("night_shifts", [])
+    business_terms = signals.get("business_hours", [])
+    mixed_terms = signals.get("mixed_shifts", [])
+    positive_night = matching_terms(normalized, night_terms)
+    positive_business = matching_terms(normalized, business_terms)
+    mixed_explicit = matching_terms(normalized, mixed_terms)
+    night_negated = _has_negated_term(normalized, night_terms)
+    time_ranges = re.compile(
+        r"(?<!\d)(?P<start>2[0-3]|[01]?\d)\s*"
+        r"(?:(?::|h)\s*(?P<start_min>[0-5]\d))?\s*h?\s*"
+        r"(?:às|as|ate|a|[-–])\s*"
+        r"(?P<end>2[0-3]|[01]?\d)\s*"
+        r"(?:(?::|h)\s*(?P<end_min>[0-5]\d))?\s*h?(?!\d)"
+    )
+    has_night_range = False
+    has_business_range = False
+    for match in time_ranges.finditer(normalized):
+        if _is_negated(normalized, match):
+            continue
+        start = int(match.group("start")) * 60 + int(match.group("start_min") or 0)
+        end = int(match.group("end")) * 60 + int(match.group("end_min") or 0)
+        if end <= start:
+            end += 24 * 60
+        range_has_night = False
+        range_has_business = False
+        for day in range(-1, 2):
+            offset = day * 24 * 60
+            if start < offset + 5 * 60 and end > offset:
+                range_has_night = True
+            if start < offset + 24 * 60 and end > offset + 22 * 60:
+                range_has_night = True
+            if start < offset + 18 * 60 and end > offset + 8 * 60:
+                range_has_business = True
+        if range_has_night:
+            has_night_range = True
+        elif range_has_business:
+            has_business_range = True
+
+    has_night = bool(positive_night) or has_night_range
+    has_business = bool(positive_business) or has_business_range
+    schedule_conflict = night_negated and has_night
+    if schedule_conflict:
+        return "Horário não informado", True
+    if mixed_explicit or (has_night and has_business):
+        return "Misto", False
+    if has_night:
+        return "Noturno confirmado", False
+    if has_business:
+        return "Horário comercial", False
+    return "Horário não informado", False
+
+
+def _priority(score: int, config: dict[str, Any], radar_id: str) -> str:
+    thresholds = config["radars"][radar_id].get(
+        "priority_thresholds", config.get("priority_thresholds", {})
+    )
+    if score >= int(thresholds.get("very_high", 101)):
+        return "Muito alta prioridade"
     if score >= int(thresholds.get("high", 80)):
         return "Alta prioridade"
     if score >= int(thresholds.get("medium", 60)):
@@ -193,9 +362,14 @@ def _job_facts(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         for kind, terms in contract_signals.items()
     }
     contracts = {kind: terms for kind, terms in contracts.items() if terms}
-    contract_conflict = any(
-        contracts.get(kind) and _has_negated_term(text, terms)
+    negated_contracts = {
+        kind
         for kind, terms in contract_signals.items()
+        if _has_negated_term(text, terms)
+    }
+    contract_conflict = any(
+        kind in contracts and kind in negated_contracts
+        for kind in contract_signals
     )
 
     modality_signals = signals.get("modalities", {})
@@ -204,13 +378,20 @@ def _job_facts(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         for kind, terms in modality_signals.items()
     }
     modalities = {kind: terms for kind, terms in modalities.items() if terms}
-    modality_conflict = any(
-        modalities.get(kind) and _has_negated_term(text, terms)
+    negated_modalities = {
+        kind
         for kind, terms in modality_signals.items()
+        if _has_negated_term(text, terms)
+    }
+    modality_conflict = any(
+        kind in modalities and kind in negated_modalities
+        for kind in modality_signals
     )
 
     levels = {
-        level: matching_terms(title, terms)
+        level: matching_terms(
+            text if level == "internship" else title, terms
+        )
         for level, terms in signals.get("seniority", {}).items()
     }
     levels = {level: terms for level, terms in levels.items() if terms}
@@ -237,9 +418,12 @@ def _job_facts(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     unconfirmed_work_location = _has_unconfirmed_work_location(
         text, location_terms.get("brasilia_region", [])
     )
+    unknown_work_location = _unknown_work_location(text)
+    outside_work_location = _has_explicit_outside_work_location(
+        text, location_terms.get("brasilia_region", [])
+    )
     brazil_locations = matching_terms(text, location_terms.get("brazil", []))
-    night_terms = matching_terms(text, signals.get("night_shifts", []))
-    other_off_hours_terms = matching_terms(text, signals.get("other_off_hours", []))
+    schedule, schedule_conflict = _schedule_classification(text, signals)
     incompatible_titles = matching_terms(
         title, signals.get("radar_a_incompatible_titles", [])
     )
@@ -253,17 +437,6 @@ def _job_facts(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     career_growth_evidence = matching_terms(
         description, signals.get("career_growth_evidence", [])
     )
-
-    schedule = "Horário não informado"
-    if night_terms:
-        schedule = "Noturno / madrugada: " + ", ".join(night_terms[:3])
-    elif other_off_hours_terms:
-        if matching_terms(text, ["fora do horário comercial"]):
-            schedule = "Fora do horário comercial indicado"
-        elif matching_terms(text, ["12x36"]):
-            schedule = "Horário não informado; escala 12x36 indicada"
-        else:
-            schedule = "Horário não informado; escala alternada indicada"
 
     contract_labels = {
         "clt": "CLT",
@@ -285,10 +458,12 @@ def _job_facts(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     return {
         "text": text,
         "contracts": set(contracts),
+        "negated_contracts": negated_contracts,
         "contract_label": " / ".join(
             contract_labels.get(kind, kind) for kind in contracts.keys()
         ) or "Não confirmado",
         "modalities": set(modalities),
+        "negated_modalities": negated_modalities,
         "modality_label": " / ".join(
             modality_labels.get(kind, kind) for kind in modalities.keys()
         ) or "Não confirmado",
@@ -307,18 +482,17 @@ def _job_facts(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         "career_growth_evidence": career_growth_evidence,
         "brasilia_locations": brasilia_locations,
         "unconfirmed_work_location": unconfirmed_work_location,
+        "unknown_work_location": unknown_work_location,
+        "outside_work_location": outside_work_location,
         "brazil_locations": brazil_locations,
-        "night_terms": night_terms,
-        "other_off_hours_terms": other_off_hours_terms,
         "schedule": schedule,
+        "schedule_conflict": schedule_conflict,
         "incompatible_titles": incompatible_titles,
         "contract_ambiguous": len(contracts) > 1,
         "contract_conflict": contract_conflict,
         "modality_ambiguous": len(modalities) > 1,
         "modality_conflict": modality_conflict,
-        "night_negated": _has_negated_term(
-            text, signals.get("night_shifts", [])
-        ),
+        "night_negated": _has_negated_term(text, signals.get("night_shifts", [])),
         "remote_negated": _has_negated_term(
             text, signals.get("modalities", {}).get("remote", [])
         ),
@@ -359,85 +533,94 @@ def evaluate_job(
     salary_text = f"{job.get('title', '')} {job.get('description', '')}"
     reasons: list[str] = []
     incompatibilities: list[str] = []
+    confirmation_reasons: list[str] = []
+
+    def rejected(reason: str) -> dict[str, Any]:
+        return {"eligible": False, "reason": reason}
+
+    def needs_confirmation(reason: str):
+        if reason not in confirmation_reasons:
+            confirmation_reasons.append(reason)
 
     contracts = facts["contracts"]
     modalities = facts["modalities"]
     levels = facts["levels"]
-    areas = facts["areas"]
+    allowed_areas = set(radar.get("allowed_areas", []))
+    areas = [area for area in facts["areas"] if area in allowed_areas]
     allowed_contracts = set(radar["allowed_contracts"])
     if facts["contract_conflict"]:
-        return {"eligible": False, "reason": "Contrato contraditório ou ambíguo"}
+        return rejected("Contrato contraditório ou ambíguo")
     if not contracts:
-        return {"eligible": False, "reason": "Tipo de contrato não confirmado"}
+        needs_confirmation(
+            "Contrato permitido não confirmado; alternativa explicitamente negada"
+            if facts["negated_contracts"]
+            else "Tipo de contrato não confirmado"
+        )
     if not contracts.issubset(allowed_contracts):
-        return {"eligible": False, "reason": "Contrato não permitido para este radar"}
-    if len(contracts) > 1:
-        return {"eligible": False, "reason": "Contrato ambíguo"}
+        return rejected("Contrato não permitido para este radar")
 
     if facts["modality_conflict"]:
-        return {"eligible": False, "reason": "Modalidade contraditória ou ambígua"}
+        return rejected("Modalidade contraditória ou ambígua")
     if not modalities:
-        return {"eligible": False, "reason": "Modalidade não confirmada"}
-    if len(modalities) != 1:
-        return {"eligible": False, "reason": "Modalidade ambígua"}
-    modality = next(iter(modalities))
-    if modality not in radar["allowed_modalities"]:
-        return {"eligible": False, "reason": "Modalidade não permitida para este radar"}
+        modality = ""
+        needs_confirmation(
+            "Modalidade alternativa não confirmada após negação explícita"
+            if facts["negated_modalities"]
+            else "Modalidade não confirmada"
+        )
+        if radar_id == "radar_b" and facts["remote_negated"]:
+            return rejected("Trabalho remoto explicitamente negado")
+    elif len(modalities) != 1:
+        return rejected("Modalidade ambígua")
+    else:
+        modality = next(iter(modalities))
+        if modality not in radar["allowed_modalities"]:
+            return rejected("Modalidade não permitida para este radar")
 
     if radar_id == "radar_a":
-        if facts["incompatible_titles"]:
-            return {
-                "eligible": False,
-                "reason": "Cargo especializado acima do perfil informado",
-            }
         if not areas:
-            return {"eligible": False, "reason": "Área não compatível com o Radar A"}
+            if facts["areas"]:
+                return rejected("Área não compatível com o Radar A")
+            needs_confirmation("Área de TI não confirmada")
         if modality == "remote":
-            if facts["brazil_negated"] or not facts["remote_brazil_confirmed"]:
-                return {
-                    "eligible": False,
-                    "reason": "Abrangência remota no Brasil não confirmada",
-                }
-        elif (
-            facts["unconfirmed_work_location"]
-            or not facts["brasilia_locations"]
-        ):
-            return {
-                "eligible": False,
-                "reason": "Local presencial/híbrido fora da região de Brasília",
-            }
-        location_label = (
-            "Remoto no Brasil"
-            if modality == "remote"
-            else ", ".join(facts["brasilia_locations"])
-        )
+            if facts["brazil_negated"]:
+                return rejected("Vaga remota explicitamente fora do Brasil")
+            if not facts["remote_brazil_confirmed"]:
+                needs_confirmation("Abrangência remota no Brasil não confirmada")
+            location_label = (
+                "Remoto no Brasil"
+                if facts["remote_brazil_confirmed"]
+                else "Remoto — abrangência Brasil pendente"
+            )
+        elif modality in {"hybrid", "onsite"}:
+            if facts["outside_work_location"]:
+                return rejected("Local presencial/híbrido explicitamente fora do DF")
+            elif facts["brasilia_locations"]:
+                location_label = ", ".join(facts["brasilia_locations"])
+            else:
+                needs_confirmation("Local de trabalho no Distrito Federal não confirmado")
+                location_label = "Localidade no DF pendente"
+        else:
+            location_label = "Modalidade e localidade pendentes"
     else:
-        if modality != "remote":
-            return {"eligible": False, "reason": "O Radar B aceita apenas vagas remotas"}
+        if modality and modality != "remote":
+            return rejected("O Radar B aceita apenas vagas remotas")
         if not levels:
-            return {"eligible": False, "reason": "Senioridade não confirmada"}
-        if len(levels) != 1:
-            return {"eligible": False, "reason": "Senioridade ambígua"}
-        level = next(iter(levels))
-        if level not in radar["allowed_seniority"]:
-            return {"eligible": False, "reason": "Senioridade não permitida para o Radar B"}
+            needs_confirmation("Senioridade não confirmada")
+        if len(levels) > 1:
+            return rejected("Senioridade ambígua")
+        level = next(iter(levels), "")
+        if level and level not in radar["allowed_seniority"]:
+            return rejected("Senioridade não permitida para o Radar B")
         is_frontend = bool(facts["senior_frontend_titles"]) and not any(
-            area in areas for area in ("backend", "fullstack")
+            area in facts["areas"] for area in ("backend", "fullstack")
         )
         if level == "senior" and not is_frontend:
-            return {
-                "eligible": False,
-                "reason": "Sênior permitido apenas para Front-end no Radar B",
-            }
+            return rejected("Sênior permitido apenas para Front-end no Radar B")
         if not areas:
-            return {"eligible": False, "reason": "Área de TI não confirmada"}
-        if level == "internship" and not any(
-            area in radar["internship_areas"] for area in areas
-        ):
-            return {
-                "eligible": False,
-                "reason": "Estágio sem relação com TI ou desenvolvimento",
-            }
+            if facts["areas"]:
+                return rejected("Área sem relação com TI para o Radar B")
+            needs_confirmation("Área de TI não confirmada")
         location_label = "Remoto"
 
     technology_count = len(facts["technologies"])
@@ -464,23 +647,30 @@ def evaluate_job(
             "Pesquisa/IA compatível: " + ", ".join(facts["research_matches"][:3])
         )
 
+    if facts["schedule_conflict"]:
+        needs_confirmation("Horário informado de forma contraditória")
+    elif facts["night_negated"]:
+        incompatibilities.append(
+            "Anúncio nega jornada noturna; horário comercial não foi confirmado"
+        )
     if radar_id == "radar_a":
-        if facts["night_terms"] and not facts["night_negated"]:
-            night_score = 100
-            reasons.append("Turno noturno/madrugada indicado na descrição")
-        elif facts["other_off_hours_terms"] and not facts["night_negated"]:
-            if matching_terms(text, ["fora do horário comercial"]):
-                night_score = 90
-                reasons.append("Disponibilidade fora do horário comercial indicada")
-            else:
-                night_score = 70
-                reasons.append("Escala flexível indicada; turno não confirmado")
-                incompatibilities.append("Turno não confirmado; escala indicada")
+        schedule_scores = radar.get("schedule_scores", {})
+        schedule_key = {
+            "Noturno confirmado": "night_confirmed",
+            "Misto": "mixed",
+            "Horário comercial": "business_hours",
+            "Horário não informado": "unknown",
+        }[facts["schedule"]]
+        score = int(schedule_scores.get(schedule_key, 50))
+        if facts["schedule"] == "Noturno confirmado":
+            reasons.append("Horário noturno confirmado")
+        elif facts["schedule"] == "Misto":
+            reasons.append("Jornada inclui períodos diurnos e noturnos")
+        elif facts["schedule"] == "Horário comercial":
+            reasons.append("Horário comercial identificado")
         else:
-            night_score = 0
-            incompatibilities.append(
-                "Horário não informado; não foi presumido turno noturno"
-            )
+            reasons.append("Horário não informado; não foi presumido")
+        score += min(4, technical_score // 25)
         seniority = min(
             levels,
             key=lambda level: {
@@ -491,55 +681,33 @@ def evaluate_job(
             }.get(level, 60),
             default="",
         )
-        experience_scores = {
-            "internship": 75,
-            "junior": 95,
-            "mid": 100,
-            "senior": 45,
-        }
-        experience_score = experience_scores.get(seniority, 60)
-        if seniority == "senior":
-            incompatibilities.append(
-                "Requisitos Sênior podem exceder a experiência Pleno informada"
-            )
-        elif not seniority:
-            incompatibilities.append("Senioridade e experiência exigida não informadas")
-        if len(levels) > 1:
-            incompatibilities.append("Senioridade indicada de forma ambígua")
-        contract_mode_score = 100
+        score += 2 if seniority in {"junior", "mid"} else 0
         salary = _salary_label(salary_text)
-        compensation_score = 100 if salary != "Não divulgado" else 60
-        weights = radar["weights"]
-        score = round(
-            night_score * weights["night_shift"]
-            + technical_score * weights["activities"]
-            + experience_score * weights["experience"]
-            + contract_mode_score * weights["contract_and_modality"]
-            + compensation_score * weights["compensation"]
-        )
+        score += 2 if salary != "Não divulgado" else 0
         if modality == "remote":
-            reasons.append("Vaga remota com abrangência no Brasil indicada")
+            if facts["remote_brazil_confirmed"]:
+                reasons.append("Vaga remota com abrangência no Brasil indicada")
         else:
-            reasons.append("Localidade na região de Brasília indicada")
+            if facts["brasilia_locations"]:
+                reasons.append("Localidade no Distrito Federal indicada")
     else:
-        level = next(iter(levels))
-        seniority_score = {
-            "internship": 100,
-            "junior": 100,
-            "mid": 100,
-            "senior": 80,
-        }[level]
-        contract_score = 100
-        remote_score = 100
-        career_score = 100 if facts["career_growth_evidence"] else 0
-        weights = radar["weights"]
-        score = round(
-            technical_score * weights["technical"]
-            + seniority_score * weights["seniority"]
-            + contract_score * weights["contract"]
-            + remote_score * weights["remote"]
-            + career_score * weights["career_growth"]
-        )
+        score = int(radar.get("base_score", 80))
+        if confirmation_reasons:
+            score = min(score, 70)
+        score += min(10, round(technical_score * 0.1))
+        if facts["schedule"] == "Horário comercial":
+            score += int(radar.get("business_hours_bonus", 5))
+            reasons.append("Horário comercial priorizado")
+        if facts["career_growth_evidence"]:
+            score += int(radar.get("career_growth_bonus", 5))
+        if level == "internship":
+            reasons.append("Estágio remoto em TI")
+        elif contracts:
+            reasons.append("Vaga PJ remota em tecnologia")
+        if facts["schedule"] in {"Noturno confirmado", "Misto"}:
+            incompatibilities.append("Jornada fora do horário comercial")
+        if confirmation_reasons:
+            score = min(score, 79)
         salary = _salary_label(salary_text)
         reasons.append("Remoto confirmado")
 
@@ -548,17 +716,31 @@ def evaluate_job(
     technologies = facts["technologies"] or ["Não identificadas no resultado público"]
     if salary == "Não divulgado":
         incompatibilities.append("Salário não divulgado")
+    if confirmation_reasons:
+        incompatibilities.extend(confirmation_reasons)
 
     return {
-        "eligible": True,
+        "eligible": not confirmation_reasons,
+        "pending_confirmation": bool(confirmation_reasons),
+        "confirmation_status": "pending" if confirmation_reasons else "confirmed",
+        "confirmation_reasons": confirmation_reasons,
         "radar_id": radar_id,
         "radar_label": radar["label"],
         "score": max(0, min(100, score)),
-        "priority": _priority(score, config),
+        "priority": _priority(score, config, radar_id),
         "contract": facts["contract_label"],
         "modality": facts["modality_label"],
         "location": location_label,
         "schedule": facts["schedule"],
+        "schedule_status": (
+            "contradictory"
+            if facts["schedule_conflict"]
+            else "explicit_negative"
+            if facts["night_negated"]
+            else "missing"
+            if facts["schedule"] == "Horário não informado"
+            else "confirmed"
+        ),
         "salary": salary,
         "technologies": technologies,
         "requirements": requirements,

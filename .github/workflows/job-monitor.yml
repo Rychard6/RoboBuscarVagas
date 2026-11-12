@@ -81,7 +81,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Dedup IDs and opportunity history live in the Actions cache, not repository commits.
+      # Cache writes are branch-scoped; restore prefixes may fall back to the default branch.
+      # Retention/eviction is limited, so the Actions cache is not permanent storage.
       # Include run_attempt because cache keys are immutable and reruns need a fresh save key.
       - name: Restore opportunity history
         uses: actions/cache/restore@v4

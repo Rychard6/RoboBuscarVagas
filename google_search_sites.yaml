@@ -1,7 +1,7 @@
 # Serper.dev searches public Google results with Brazilian Portuguese queries.
 #
-# Search is discovery only. Mandatory contract, location, modality, and seniority
-# checks are applied to each result before scoring or notification.
+# Search is discovery only. Explicit incompatibilities are rejected before scoring;
+# missing eligibility details remain pending for confirmation.
 
 settings:
   enabled: true
@@ -15,18 +15,19 @@ settings:
   serper_time_filter: "qdr:d"
   serper_max_retries_per_query: 2
   serper_stop_on_rate_limit: true
+  job_page_max_fetches: 20
 
 # Three independent search groups per radar keep a broad but manageable search budget.
 # Do not add shift/contract/modality exclusions here; each radar validates these separately.
 queries:
   radar_a:
-    - '("suporte técnico" OR "help desk" OR "service desk" OR NOC OR "monitoramento de sistemas" OR "operador de sistemas") (vaga OR emprego)'
-    - '("back office" OR "auxiliar administrativo" OR "assistente de operações" OR digitador OR "processamento de dados" OR "cadastro de dados") (vaga OR emprego)'
+    - '("suporte técnico" OR "suporte de TI" OR "suporte de aplicações" OR "help desk" OR "service desk" OR NOC OR "atendimento técnico") (vaga OR emprego)'
+    - '("monitoramento de sistemas" OR "monitoramento de infraestrutura" OR "operações de TI" OR "operador de sistemas" OR infraestrutura OR DevOps OR cibersegurança OR "segurança da informação") (vaga OR emprego)'
     - '(Angular OR React OR Next.js OR JavaScript OR TypeScript OR Node.js OR NestJS OR Java OR Python OR COBOL OR Azure OR "Power BI") (desenvolvedor OR infraestrutura OR sistemas) vaga'
   radar_b:
     - '("desenvolvedor front-end" OR "desenvolvedor back-end" OR "full stack" OR "engenharia de software") (Angular OR React OR Next.js OR JavaScript OR TypeScript OR Node.js OR NestJS OR Java OR Python OR COBOL OR "Power BI")'
-    - '(suporte OR NOC OR DevOps OR "cloud computing" OR "Microsoft Azure" OR infraestrutura OR "service desk") (júnior OR pleno OR remoto)'
-    - '(estágio OR estagiário OR estagiária) (TI OR tecnologia OR desenvolvimento OR informática) remoto'
+    - '(suporte OR NOC OR DevOps OR "cloud computing" OR "Microsoft Azure" OR infraestrutura OR "service desk") (júnior OR junior OR pleno OR remoto)'
+    - '(estágio OR estagiário OR estagiária OR internship OR intern) (TI OR tecnologia OR desenvolvimento OR informática OR suporte OR infraestrutura) remoto'
 
 # Google search domain restrictions. Results are public search listings; the bot does not
 # authenticate to job boards or access their private endpoints.

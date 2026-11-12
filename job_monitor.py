@@ -13,9 +13,11 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import time
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -136,6 +138,176 @@ def coerce_string_list(value: Any, default: list[str]) -> list[str]:
         values = [str(item).strip().lower() for item in value if str(item).strip()]
         return values if values else default
     return default
+
+
+class _JobPageParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title_parts: list[str] = []
+        self.meta: dict[str, str] = {}
+        self.visible_text: list[str] = []
+        self.json_ld: list[str] = []
+        self._title_depth = 0
+        self._skip_depth = 0
+        self._json_ld_depth = 0
+        self._skipped_tags: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]):
+        attributes = {key.lower(): value or "" for key, value in attrs}
+        if tag == "meta":
+            key = attributes.get("name", "") or attributes.get("property", "")
+            content = attributes.get("content", "").strip()
+            if key and content and key.lower() in {
+                "description", "og:title", "og:description", "twitter:title",
+                "twitter:description",
+            }:
+                self.meta.setdefault(key.lower(), content)
+        elif tag == "title":
+            self._title_depth += 1
+        elif tag in {"script", "style", "noscript", "svg"}:
+            if tag == "script" and attributes.get("type", "").lower() == "application/ld+json":
+                self._json_ld_depth += 1
+            else:
+                self._skip_depth += 1
+                self._skipped_tags.append(tag)
+
+    def handle_endtag(self, tag: str):
+        if tag == "title" and self._title_depth:
+            self._title_depth -= 1
+        elif tag == "script" and self._json_ld_depth:
+            self._json_ld_depth -= 1
+        elif self._skipped_tags and self._skipped_tags[-1] == tag:
+            self._skipped_tags.pop()
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str):
+        value = " ".join(data.split())
+        if not value:
+            return
+        if self._json_ld_depth:
+            self.json_ld.append(data)
+        elif self._title_depth:
+            self.title_parts.append(value)
+        elif not self._skip_depth:
+            self.visible_text.append(value)
+
+
+def _plain_page_text(value: Any) -> str:
+    return " ".join(re.sub(r"<[^>]*>", " ", html.unescape(str(value or ""))).split())
+
+
+def _extract_job_page_details(page: str) -> dict[str, str]:
+    parser = _JobPageParser()
+    parser.feed(page)
+    title = parser.meta.get("og:title") or parser.meta.get("twitter:title")
+    if not title:
+        title = " ".join(parser.title_parts)
+    description_parts = [
+        parser.meta.get("description", ""),
+        parser.meta.get("og:description", ""),
+        parser.meta.get("twitter:description", ""),
+    ]
+    structured_parts: list[str] = []
+    structured_title = ""
+
+    def visit(value: Any):
+        nonlocal structured_title
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+        types = value.get("@type", [])
+        if isinstance(types, str):
+            types = [types]
+        if any(str(job_type).rsplit("/", 1)[-1] == "JobPosting" for job_type in types):
+            structured_title = structured_title or str(value.get("title") or "")
+            if value.get("description"):
+                description_parts.append(str(value["description"]))
+            employment_type = value.get("employmentType", [])
+            if isinstance(employment_type, str):
+                employment_type = [employment_type]
+            if any("intern" in str(item).lower() for item in employment_type):
+                structured_parts.append("Estágio")
+            elif any(str(item).strip().upper() == "PJ" for item in employment_type):
+                structured_parts.append("PJ")
+            remote_listing = str(value.get("jobLocationType", "")).upper() in {
+                "TELECOMMUTE", "REMOTE",
+            }
+            if remote_listing:
+                structured_parts.append("trabalho remoto")
+            work_hours = value.get("workHours")
+            if work_hours:
+                structured_parts.append(str(work_hours))
+            locations = value.get("jobLocation", [])
+            if isinstance(locations, dict):
+                locations = [locations]
+            remote_in_brazil = False
+            for location in locations:
+                if not isinstance(location, dict):
+                    continue
+                address = location.get("address", {})
+                if isinstance(address, dict):
+                    locality = address.get("addressLocality")
+                    region = address.get("addressRegion")
+                    country = address.get("addressCountry")
+                    country_name = (
+                        "Brasil"
+                        if str(country).upper() in {"BR", "BRA", "BRASIL", "BRAZIL"}
+                        else str(country or "")
+                    )
+                    if remote_listing and country_name == "Brasil":
+                        remote_in_brazil = True
+                    address_parts = [
+                        str(part) for part in (locality, region, country_name) if part
+                    ]
+                    if address_parts:
+                        structured_parts.append(
+                            "Local de trabalho em " + ", ".join(address_parts)
+                        )
+            if remote_in_brazil:
+                structured_parts.append("Vaga remota no Brasil")
+        for nested in value.values():
+            if isinstance(nested, (dict, list)):
+                visit(nested)
+
+    for raw_json in parser.json_ld:
+        try:
+            visit(json.loads(raw_json))
+        except json.JSONDecodeError:
+            continue
+
+    body_text = " ".join(parser.visible_text)
+    description_parts = structured_parts + description_parts + [body_text[:12000]]
+    return {
+        "title": structured_title or title,
+        "description": " ".join(
+            part for part in (_plain_page_text(value) for value in description_parts) if part
+        )[:6000],
+    }
+
+
+def _job_page_host_allowed(url: str, domains: list[str]) -> bool:
+    try:
+        parts = urlsplit(url)
+        if (
+            parts.scheme.lower() != "https"
+            or not parts.hostname
+            or parts.username
+            or parts.password
+            or parts.port not in (None, 443)
+        ):
+            return False
+        host = parts.hostname.lower().rstrip(".")
+    except ValueError:
+        return False
+    return any(
+        host == configured.split("/", 1)[0].lower()
+        or host.endswith("." + configured.split("/", 1)[0].lower())
+        for configured in domains
+    )
+
 
 # ============= SCRAPER HEALTH TRACKING =============
 class ScraperHealth:
@@ -321,6 +493,34 @@ class AsyncHTTPClient:
                 error_state.update({'last_error': last_error})
             return None
 
+    async def get_job_page(self, url: str, max_bytes: int = 1_000_000) -> Optional[str]:
+        safe_url = redact_url(url)
+        async with self._semaphore:
+            session = await self.get_session()
+            domain = urlsplit(url).netloc.lower()
+            try:
+                await self._apply_domain_throttle(domain)
+                async with session.get(url, allow_redirects=False) as response:
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    if response.status != 200 or not (
+                        "text/html" in content_type or "application/xhtml+xml" in content_type
+                    ):
+                        logger.info(
+                            "Could not read job page %s (status=%s, content_type=%s)",
+                            safe_url,
+                            response.status,
+                            content_type or "unknown",
+                        )
+                        return None
+                    body = await response.content.read(max_bytes + 1)
+                    if len(body) > max_bytes:
+                        logger.info("Skipped oversized job page %s", safe_url)
+                        return None
+                    return body.decode(response.charset or "utf-8", errors="replace")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                logger.info("Could not read job page %s: %s", safe_url, error)
+                return None
+
 http_client = AsyncHTTPClient()
 
 # ============= JOB SITE SCRAPER =============
@@ -328,6 +528,7 @@ class JobSiteScraper:
     def __init__(self, seen_jobs_file: str = 'seen_jobs.json'):
         self.seen_jobs_file = seen_jobs_file
         self.job_history: dict[str, dict[str, Any]] = {}
+        self.job_page_cache: dict[str, dict[str, Any]] = {}
         self.last_digest_date = ''
         self.seen_jobs = self.load_seen_jobs()
         self.metrics = {
@@ -338,6 +539,14 @@ class JobSiteScraper:
             'google_stopped_early_reason': '',
             'google_last_error': '',
             'jobs_rejected_radar': 0,
+            'jobs_rejected_by_radar': {'radar_a': 0, 'radar_b': 0},
+            'job_rejection_reasons': {'radar_a': {}, 'radar_b': {}},
+            'jobs_pending_confirmation_by_radar': {'radar_a': 0, 'radar_b': 0},
+            'job_pages_available': 0,
+            'job_pages_attempted': 0,
+            'job_pages_succeeded': 0,
+            'job_pages_skipped_budget': 0,
+            'job_pages_skipped_successfully_fetched': 0,
         }
     
     def load_seen_jobs(self) -> dict[str, float]:
@@ -353,6 +562,11 @@ class JobSiteScraper:
                             self.job_history = (
                                 payload.get('jobs', {})
                                 if isinstance(payload.get('jobs'), dict)
+                                else {}
+                            )
+                            self.job_page_cache = (
+                                payload.get('job_page_cache', {})
+                                if isinstance(payload.get('job_page_cache'), dict)
                                 else {}
                             )
                             self.last_digest_date = str(
@@ -383,6 +597,7 @@ class JobSiteScraper:
                         'version': 2,
                         'seen_jobs': self.seen_jobs,
                         'jobs': self.job_history,
+                        'job_page_cache': self.job_page_cache,
                         'last_digest_date': self.last_digest_date,
                     },
                     f,
@@ -420,6 +635,18 @@ class JobSiteScraper:
                 reverse=True,
             )
             self.job_history = dict(newest_first[:JOB_HISTORY_MAX])
+        self.job_page_cache = {
+            job_id: record
+            for job_id, record in self.job_page_cache.items()
+            if now - float(record.get('updated_at', now)) <= ttl_seconds
+        }
+        if len(self.job_page_cache) > JOB_HISTORY_MAX:
+            newest_first = sorted(
+                self.job_page_cache.items(),
+                key=lambda item: float(item[1].get('updated_at', 0)),
+                reverse=True,
+            )
+            self.job_page_cache = dict(newest_first[:JOB_HISTORY_MAX])
     
     def generate_job_id(self, url: str) -> str:
         # Dedup on the normalized URL alone — it uniquely identifies a posting and is
@@ -472,6 +699,7 @@ class JobSiteScraper:
                     for key in (
                         'radar_id', 'radar_label', 'score', 'priority',
                         'fit_reason', 'incompatibilities', 'tracking_status',
+                        'confirmation_status', 'confirmation_reasons',
                     )
                     if key in match
                 }
@@ -483,7 +711,11 @@ class JobSiteScraper:
                     'radar_ids': [match['radar_id'] for match in matches],
                     'radar_results': radar_results,
                     'is_high_priority': any(
-                        match.get('priority') == 'Alta prioridade' for match in matches
+                        match.get('confirmation_status', 'confirmed') == 'confirmed'
+                        and match.get('priority') in {
+                            'Alta prioridade', 'Muito alta prioridade'
+                        }
+                        for match in matches
                     ),
                 }
             )
@@ -535,7 +767,15 @@ class JobSiteScraper:
             f"  google_rate_limited={self.metrics['google_rate_limited']}\n"
             f"  google_stopped_early_reason={self.metrics['google_stopped_early_reason'] or 'none'}\n"
             f"  google_last_error={self.metrics['google_last_error'] or 'none'}\n"
-            f"  jobs_rejected_radar={self.metrics['jobs_rejected_radar']}"
+            f"  jobs_rejected_radar={self.metrics['jobs_rejected_radar']}\n"
+            f"  jobs_rejected_by_radar={json.dumps(self.metrics['jobs_rejected_by_radar'], ensure_ascii=False, sort_keys=True)}\n"
+            f"  job_rejection_reasons={json.dumps(self.metrics['job_rejection_reasons'], ensure_ascii=False, sort_keys=True)}\n"
+            f"  jobs_pending_confirmation_by_radar={json.dumps(self.metrics['jobs_pending_confirmation_by_radar'], ensure_ascii=False, sort_keys=True)}\n"
+            f"  job_pages_available={self.metrics['job_pages_available']}\n"
+            f"  job_pages_attempted={self.metrics['job_pages_attempted']}\n"
+            f"  job_pages_succeeded={self.metrics['job_pages_succeeded']}\n"
+            f"  job_pages_skipped_budget={self.metrics['job_pages_skipped_budget']}\n"
+            f"  job_pages_skipped_successfully_fetched={self.metrics['job_pages_skipped_successfully_fetched']}"
         )
 
     # ============= SERPER.DEV (GOOGLE RESULTS VIA SINGLE API KEY) =============
@@ -559,6 +799,7 @@ class JobSiteScraper:
         queries_by_radar = search_config.get('queries', {})
         sites = search_config.get('sites', [])
         max_results = settings.get('max_results_per_query', 10)
+        max_job_page_fetches = max(0, int(settings.get('job_page_max_fetches', 20)))
         min_seconds_between_queries = max(0.0, float(settings.get('min_seconds_between_queries', 1.0)))
         max_consecutive_failures = max(1, int(settings.get('max_consecutive_failures', 3)))
         serper_max_retries_per_query = max(1, int(settings.get('serper_max_retries_per_query', 2)))
@@ -692,14 +933,59 @@ class JobSiteScraper:
                     source = f"Serper-{board}"
                     description = str(item.get('snippet', '')).strip()
                     if job_id not in jobs_by_id:
+                        previous_record = self.job_history.get(job_id, {})
+                        cached_page = self.job_page_cache.get(job_id, {})
+                        page_was_fetched = (
+                            cached_page.get('status') == 'success'
+                            and cached_page.get('succeeded_at')
+                        ) or (
+                            previous_record.get('job_page_status') == 'success'
+                            and previous_record.get('job_page_succeeded_at')
+                        )
+                        page_details = (
+                            cached_page
+                            if cached_page.get('status') == 'success'
+                            else previous_record
+                        )
                         jobs_by_id[job_id] = {
                             'id': job_id,
-                            'title': title,
-                            'company': company,
+                            'title': (
+                                page_details.get('title', title)
+                                if page_was_fetched else title
+                            ),
+                            'company': (
+                                page_details.get('company', company)
+                                if page_was_fetched else company
+                            ),
                             'url': job_url,
                             'source': source,
                             'sources': [source],
-                            'description': description,
+                            'description': (
+                                page_details.get('description', description)
+                                if page_was_fetched else description
+                            ),
+                            'job_page_checked_at': (
+                                cached_page.get(
+                                    'last_attempt_at',
+                                    previous_record.get('job_page_checked_at', 0),
+                                )
+                                if page_was_fetched else 0
+                            ),
+                            'job_page_last_attempt_at': (
+                                cached_page.get(
+                                    'last_attempt_at',
+                                    previous_record.get('job_page_last_attempt_at', 0),
+                                )
+                                if page_was_fetched else 0
+                            ),
+                            'job_page_status': 'success' if page_was_fetched else '',
+                            'job_page_succeeded_at': (
+                                cached_page.get(
+                                    'succeeded_at',
+                                    previous_record.get('job_page_succeeded_at', 0),
+                                )
+                                if page_was_fetched else 0
+                            ),
                             'published_at': item.get('date') or item.get('datePublished') or '',
                         }
                     else:
@@ -715,24 +1001,149 @@ class JobSiteScraper:
 
                 await asyncio.sleep(next_query_delay())
 
+            page_candidates = []
+            for job in jobs_by_id.values():
+                previous_job_record = self.job_history.get(job['id'], {})
+                cached_page = self.job_page_cache.get(job['id'], {})
+                if (
+                    (
+                        cached_page.get('status') == 'success'
+                        and cached_page.get('succeeded_at')
+                    )
+                    or (
+                        previous_job_record.get('job_page_status') == 'success'
+                        and previous_job_record.get('job_page_succeeded_at')
+                    )
+                ):
+                    self.metrics['job_pages_skipped_successfully_fetched'] += 1
+                    continue
+                evaluations = [
+                    evaluate_job(job, radar_id, RADAR_CONFIG)
+                    for radar_id in queries_by_radar
+                    if radar_id in RADAR_CONFIG.get('radars', {})
+                ]
+                needs_page = any(
+                    result.get('pending_confirmation')
+                    or (
+                        result.get('radar_id') == 'radar_a'
+                        and result.get('schedule') == 'Horário não informado'
+                    )
+                    for result in evaluations
+                )
+                if not needs_page:
+                    continue
+                if _job_page_host_allowed(job['url'], domains):
+                    page_candidates.append(
+                        (
+                            0 if any(
+                                result.get('pending_confirmation')
+                                for result in evaluations
+                            ) else 1,
+                            job,
+                        )
+                    )
+            self.metrics['job_pages_available'] = len(page_candidates)
+            page_candidates.sort(key=lambda item: item[0])
+            page_attempts = [
+                job for _, job in page_candidates[:max_job_page_fetches]
+            ]
+            self.metrics['job_pages_attempted'] = len(page_attempts)
+            self.metrics['job_pages_skipped_budget'] = (
+                len(page_candidates) - len(page_attempts)
+            )
+            page_html_results = await asyncio.gather(
+                *(
+                    http_client.get_job_page(job['url'])
+                    for job in page_attempts
+                )
+            )
+            for job, page_html in zip(page_attempts, page_html_results):
+                attempted_at = time.time()
+                page_cache_record = self.job_page_cache.get(job['id'], {}).copy()
+                job['job_page_checked_at'] = attempted_at
+                job['job_page_last_attempt_at'] = attempted_at
+                job['job_page_status'] = 'success' if page_html else 'failed'
+                page_cache_record.update(
+                    {
+                        'status': job['job_page_status'],
+                        'last_attempt_at': attempted_at,
+                        'updated_at': attempted_at,
+                    }
+                )
+                if page_html:
+                    job['job_page_succeeded_at'] = attempted_at
+                    page_cache_record['succeeded_at'] = attempted_at
+                    self.metrics['job_pages_succeeded'] += 1
+                else:
+                    job['job_page_succeeded_at'] = page_cache_record.get(
+                        'succeeded_at', 0
+                    )
+                page_cache_record.update(
+                    {'title': job['title'], 'description': job['description']}
+                )
+                self.job_page_cache[job['id']] = page_cache_record
+                if not page_html:
+                    continue
+                try:
+                    details = _extract_job_page_details(page_html)
+                except (RecursionError, ValueError) as error:
+                    logger.info(
+                        "Could not parse job page %s: %s",
+                        redact_url(job['url']),
+                        error,
+                    )
+                    continue
+                if details['title']:
+                    job['title'] = details['title']
+                if details['description']:
+                    job['description'] = " ".join(
+                        dict.fromkeys(
+                            part
+                            for part in (job['description'], details['description'])
+                            if part
+                        )
+                    )
+                if details['title'] or details['description']:
+                    page_cache_record.update(
+                        {'title': job['title'], 'description': job['description']}
+                    )
+
             for job in jobs_by_id.values():
                 job['source'] = ', '.join(job['sources'])
                 for radar_id in queries_by_radar:
                     if radar_id not in RADAR_CONFIG.get('radars', {}):
                         continue
                     result = evaluate_job(job, radar_id, RADAR_CONFIG)
-                    if not result.get('eligible'):
+                    if not result.get('eligible') and not result.get(
+                        'pending_confirmation'
+                    ):
                         self.metrics['jobs_rejected_radar'] += 1
+                        self.metrics['jobs_rejected_by_radar'][radar_id] += 1
+                        reason = result.get('reason', 'not eligible')
+                        reasons = self.metrics['job_rejection_reasons'][radar_id]
+                        reasons[reason] = reasons.get(reason, 0) + 1
                         previous_record = self.job_history.get(job['id'], {})
                         previous_radar = previous_record.get('radars', {}).get(radar_id, {})
                         if previous_radar.get('delivery_status') == 'pending_digest':
                             previous_radar['delivery_status'] = 'ineligible'
                             previous_record['updated_at'] = time.time()
-                        logger.debug(
-                            f"Rejected {job['title'][:100]} for {radar_id}: "
-                            f"{result.get('reason', 'not eligible')}"
+                        logger.info(
+                            "Rejected radar=%s title=%r url=%s reason=%s",
+                            radar_id,
+                            job['title'],
+                            redact_url(job['url']),
+                            reason,
                         )
                         continue
+                    if result.get('pending_confirmation'):
+                        self.metrics['jobs_pending_confirmation_by_radar'][radar_id] += 1
+                        logger.info(
+                            "Pending confirmation radar=%s title=%r url=%s reasons=%s",
+                            radar_id,
+                            job['title'],
+                            redact_url(job['url']),
+                            "; ".join(result.get('confirmation_reasons', [])),
+                        )
 
                     record = self.job_history.setdefault(
                         job['id'],
@@ -744,6 +1155,17 @@ class JobSiteScraper:
                             'sources': job['sources'],
                             'description': job['description'],
                             'published_at': job['published_at'],
+                            'job_page_checked_at': job.get('job_page_checked_at', 0),
+                            'job_page_last_attempt_at': job.get(
+                                'job_page_last_attempt_at', 0
+                            ),
+                            'job_page_status': job.get('job_page_status', ''),
+                            'job_page_succeeded_at': job.get(
+                                'job_page_succeeded_at',
+                                self.job_page_cache.get(job['id'], {}).get(
+                                    'succeeded_at', 0
+                                ),
+                            ),
                             'tracking_status': 'nova',
                             'radars': {},
                             'created_at': time.time(),
@@ -758,6 +1180,24 @@ class JobSiteScraper:
                             'sources': job['sources'],
                             'description': job['description'],
                             'published_at': job['published_at'] or record.get('published_at', ''),
+                            'job_page_checked_at': (
+                                job.get('job_page_checked_at')
+                                or record.get('job_page_checked_at', 0)
+                            ),
+                            'job_page_last_attempt_at': job.get(
+                                'job_page_last_attempt_at',
+                                record.get('job_page_last_attempt_at', 0),
+                            ),
+                            'job_page_status': job.get(
+                                'job_page_status', record.get('job_page_status', '')
+                            ),
+                            'job_page_succeeded_at': job.get(
+                                'job_page_succeeded_at',
+                                self.job_page_cache.get(job['id'], {}).get(
+                                    'succeeded_at',
+                                    record.get('job_page_succeeded_at', 0),
+                                ),
+                            ),
                             'updated_at': time.time(),
                         }
                     )
@@ -769,8 +1209,10 @@ class JobSiteScraper:
                     }
                     radar_record.update(
                         {
-                            'delivery_status': previous.get(
-                                'delivery_status', 'pending_digest'
+                            'delivery_status': (
+                                'pending_digest'
+                                if previous.get('delivery_status') in {None, 'ineligible'}
+                                else previous['delivery_status']
                             ),
                             'tracking_status': previous.get(
                                 'tracking_status', record.get('tracking_status', 'nova')
@@ -916,6 +1358,13 @@ async def send_telegram_notification(
                 )
                 score = int(result.get('score', 0))
                 job_text += f"<b>[{radar_label}]</b> ⭐ {score}/100 — {priority}\n"
+                if result.get('confirmation_status') == 'pending':
+                    pending_reasons = _escape_text(
+                        '; '.join(result.get('confirmation_reasons', [])),
+                        220,
+                        fallback='Verifique os dados da vaga',
+                    )
+                    job_text += f"⏳ Pendente de confirmação: {pending_reasons}\n"
                 job_text += f"📌 Status neste radar: {tracking_status}\n"
                 job_text += f"✅ Compatibilidade: {fit_reason}\n"
                 job_text += f"⚠️ Atenção: {incompatibilities}\n"
@@ -1026,7 +1475,33 @@ def build_status_message(metrics: dict, new_job_count: int, issues: list[str]) -
     )
     rejected = metrics.get('jobs_rejected_radar', 0)
     if rejected:
-        lines.append(f"🚫 Rejected by mandatory radar rules: {rejected}")
+        lines.append(f"🚫 Rejected by radar rules: {rejected}")
+        radar_labels = {
+            'radar_a': 'RADAR A',
+            'radar_b': 'RADAR B',
+        }
+        counts = metrics.get('jobs_rejected_by_radar', {})
+        reasons = metrics.get('job_rejection_reasons', {})
+        for radar_id, label in radar_labels.items():
+            radar_count = counts.get(radar_id, 0)
+            if not radar_count:
+                continue
+            reason_summary = ", ".join(
+                f"{html.escape(reason, quote=False)}: {count}"
+                for reason, count in sorted(reasons.get(radar_id, {}).items())
+            )
+            lines.append(
+                f"• {label}: {radar_count}"
+                + (f" ({reason_summary})" if reason_summary else "")
+            )
+    pending = metrics.get('jobs_pending_confirmation_by_radar', {})
+    pending_summary = ", ".join(
+        f"{label}: {pending.get(radar_id, 0)}"
+        for radar_id, label in (('radar_a', 'RADAR A'), ('radar_b', 'RADAR B'))
+        if pending.get(radar_id, 0)
+    )
+    if pending_summary:
+        lines.append(f"⏳ Pending confirmation — {pending_summary}")
     working = health_tracker.get_working_sites()
     if working:
         summary = ", ".join(f"{w['site']}({w['jobs_found']})" for w in working)
@@ -1082,13 +1557,28 @@ def print_history(scraper: JobSiteScraper):
         reverse=True,
     ):
         print(f"\n[{job_id[:12]}] {record.get('title', 'Cargo não informado')}")
-        print(f"  Link: {record.get('url', '')}")
+        print(f"  URL: {record.get('url', '')}")
         for radar_id, radar in record.get('radars', {}).items():
+            radar_label = radar.get('radar_label', radar_id)
+            tracking_status = radar.get(
+                'tracking_status', record.get('tracking_status', 'nova')
+            )
+            confirmation_status = radar.get('confirmation_status', 'Não registrado')
+            if confirmation_status == 'pending':
+                confirmation_status = 'Pendente'
+            elif confirmation_status == 'confirmed':
+                confirmation_status = 'Confirmada'
+            print(f"  {radar_label}:")
+            print(f"    Status de acompanhamento: {tracking_status}")
+            print(f"    Status de confirmação: {confirmation_status}")
+            if radar.get('confirmation_status') == 'pending':
+                reasons = radar.get('confirmation_reasons') or [
+                    'Motivo não registrado'
+                ]
+                print(f"    Motivo da pendência: {'; '.join(reasons)}")
             print(
-                f"  {radar.get('radar_label', radar_id)}: "
-                f"{radar.get('score', 0)}/100 — {radar.get('priority', '')}; "
-                f"status={radar.get('tracking_status', record.get('tracking_status', 'nova'))}; "
-                f"notificação={radar.get('delivery_status', 'pendente')}"
+                f"    Status de notificação: "
+                f"{radar.get('delivery_status', 'pendente')}"
             )
 
 
