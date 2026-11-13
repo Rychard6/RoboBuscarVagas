@@ -232,6 +232,8 @@ class JobHistoryTests(unittest.TestCase):
                         "radar_label": "RADAR A — SEGUNDA RENDA",
                         "score": 65,
                         "priority": "Média prioridade",
+                        "confirmation_status": "pending",
+                        "confirmation_reasons": ["Modalidade não confirmada"],
                         "delivery_status": "pending_digest",
                         "fit_reason": "Compatível",
                         "incompatibilities": [],
@@ -253,21 +255,40 @@ class JobHistoryTests(unittest.TestCase):
             self.assertEqual(len(digest), 1)
             self.assertEqual(len(digest[0]["radar_results"]), 2)
             self.assertFalse(digest[0]["is_high_priority"])
+            self.assertEqual(
+                digest[0]["radar_results"][0]["confirmation_status"], "pending"
+            )
+            self.assertEqual(
+                digest[0]["radar_results"][0]["confirmation_reasons"],
+                ["Modalidade não confirmada"],
+            )
             scraper.mark_jobs_as_seen(digest)
             self.assertEqual(scraper.get_pending_digest(), [])
 
-    def test_daily_digest_is_due_once_at_2355_utc_and_date_is_persisted(self):
-        now = datetime(2025, 1, 2, 23, 55, tzinfo=timezone.utc)
+    def test_daily_digest_is_due_at_0030_utc_and_catches_up_late_schedule_runs(self):
+        now = datetime(2025, 1, 3, 0, 30, tzinfo=timezone.utc)
+        self.assertTrue(job_monitor.is_daily_digest_due(now, "", "schedule", 0, 30))
         self.assertTrue(job_monitor.is_daily_digest_due(now, "", "schedule"))
         self.assertFalse(
-            job_monitor.is_daily_digest_due(now, "2025-01-02", "schedule")
+            job_monitor.is_daily_digest_due(now, "2025-01-03", "schedule", 0, 30)
         )
         self.assertFalse(job_monitor.is_daily_digest_due(now, "", "workflow_dispatch"))
         self.assertFalse(
             job_monitor.is_daily_digest_due(
-                datetime(2025, 1, 2, 23, 54, tzinfo=timezone.utc),
+                datetime(2025, 1, 3, 0, 29, tzinfo=timezone.utc),
                 "",
                 "schedule",
+                0,
+                30,
+            )
+        )
+        self.assertTrue(
+            job_monitor.is_daily_digest_due(
+                datetime(2025, 1, 3, 3, 55, tzinfo=timezone.utc),
+                "",
+                "schedule",
+                0,
+                30,
             )
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -306,10 +327,13 @@ class JobHistoryTests(unittest.TestCase):
         workflow = (
             Path(__file__).parent / ".github" / "workflows" / "job-monitor.yml"
         ).read_text(encoding="utf-8")
+        self.assertIn('cron: "30 0 * * *"', workflow)
         self.assertIn('cron: "55 3,7,11,15,19,23 * * *"', workflow)
         self.assertIn("github.run_id }}-${{ github.run_attempt", workflow)
         self.assertIn("branches:\n      - developer", workflow)
         self.assertEqual(workflow.count("key: seen-jobs-${{ github.run_id }}-${{ github.run_attempt }}"), 2)
+        self.assertEqual(job_monitor.NOTIFICATIONS_CONFIG["heartbeat_hour_utc"], 0)
+        self.assertEqual(job_monitor.NOTIFICATIONS_CONFIG["heartbeat_minute_utc"], 30)
 
 
 class RadarSearchIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -689,6 +713,114 @@ class RadarSearchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Candidatura original", message)
         self.assertIn("&lt;Front-end&gt;", message)
         self.assertIn("Pendente de confirmação: Senioridade não confirmada", message)
+
+
+class DailyDigestFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scheduled_digest_sends_pending_jobs_without_high_priority_jobs(self):
+        pending_job = {
+            "id": "pending-job",
+            "title": "Desenvolvedor",
+            "is_high_priority": False,
+        }
+
+        class FakeScraper:
+            last_digest_date = ""
+            metrics = {}
+
+            async def scrape_serper_search(self):
+                return [pending_job]
+
+            def log_operational_metrics(self):
+                pass
+
+            def get_pending_digest(self):
+                return [pending_job]
+
+            def mark_jobs_as_seen(self, jobs):
+                pass
+
+            def save_seen_jobs(self):
+                return True
+
+        fixed_now_utc = datetime(2026, 11, 13, 0, 30, tzinfo=timezone.utc)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return fixed_now_utc.replace(tzinfo=None)
+                return fixed_now_utc.astimezone(tz)
+
+        send_notification = AsyncMock(return_value=True)
+        with (
+            patch.object(job_monitor, "JobSiteScraper", return_value=FakeScraper()),
+            patch.object(job_monitor, "datetime", FixedDateTime),
+            patch.object(job_monitor, "send_telegram_notification", new=send_notification),
+            patch.object(job_monitor, "send_telegram_status", new=AsyncMock(return_value=True)),
+            patch.object(job_monitor.http_client, "close", new=AsyncMock()),
+            patch.object(job_monitor, "detect_run_issues", return_value=[]),
+            patch.object(job_monitor, "SERPER_API_KEY", "test-key"),
+            patch.dict(
+                job_monitor.NOTIFICATIONS_CONFIG,
+                {"heartbeat_hour_utc": 0, "heartbeat_minute_utc": 30},
+            ),
+            patch.dict(job_monitor.os.environ, {"GITHUB_EVENT_NAME": "schedule"}),
+            self.assertLogs("job_monitor", level="INFO") as logs,
+        ):
+            await job_monitor.main()
+
+        send_notification.assert_awaited_once()
+        self.assertEqual(send_notification.await_args.args[0], [pending_job])
+        self.assertTrue(send_notification.await_args.kwargs["daily_digest"])
+        self.assertIn("time_reached=True due=True", "\n".join(logs.output))
+        self.assertIn("1 opportunities will be included", "\n".join(logs.output))
+        self.assertIn("Attempting Telegram delivery for daily summary", "\n".join(logs.output))
+        self.assertIn("Telegram confirmed daily summary delivery", "\n".join(logs.output))
+
+
+class TelegramApiConfirmationTests(unittest.IsolatedAsyncioTestCase):
+    class Response:
+        status = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def json(self, content_type=None):
+            return self.body
+
+    class Session:
+        def __init__(self, body):
+            self.response = TelegramApiConfirmationTests.Response(body)
+
+        def post(self, url, json):
+            return self.response
+
+    async def test_delivery_requires_telegram_ok_confirmation(self):
+        session = self.Session({"ok": True, "result": {"message_id": 1}})
+        with self.assertLogs("job_monitor", level="INFO") as logs:
+            sent = await job_monitor._deliver_telegram_message(
+                session, "https://telegram.example/sendMessage", {}
+            )
+
+        self.assertTrue(sent)
+        self.assertIn("Telegram API confirmed message delivery", "\n".join(logs.output))
+
+    async def test_http_success_with_telegram_error_is_not_treated_as_delivery(self):
+        session = self.Session({"ok": False, "description": "Forbidden"})
+        with self.assertLogs("job_monitor", level="ERROR") as logs:
+            sent = await job_monitor._deliver_telegram_message(
+                session, "https://telegram.example/sendMessage", {}
+            )
+
+        self.assertFalse(sent)
+        self.assertIn("did not confirm delivery", "\n".join(logs.output))
+        self.assertIn("Forbidden", "\n".join(logs.output))
 
 
 if __name__ == "__main__":

@@ -1253,7 +1253,20 @@ async def _deliver_telegram_message(session, url: str, payload: dict) -> bool:
         try:
             async with session.post(url, json=payload) as response:
                 if response.status == 200:
-                    return True
+                    result = await response.json(content_type=None)
+                    if isinstance(result, dict) and result.get('ok') is True:
+                        logger.info("Telegram API confirmed message delivery")
+                        return True
+                    description = (
+                        result.get('description', 'missing ok=true confirmation')
+                        if isinstance(result, dict)
+                        else 'invalid response body'
+                    )
+                    logger.error(
+                        "Telegram API did not confirm delivery (HTTP 200): %s",
+                        description,
+                    )
+                    return False
 
                 error_text = await response.text()
                 retriable = response.status in (429, 500, 502, 503, 504)
@@ -1397,7 +1410,8 @@ async def send_telegram_notification(
 
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-        for msg, message_jobs in messages:
+        message_type = 'daily summary' if daily_digest else 'job notification'
+        for index, (msg, message_jobs) in enumerate(messages, 1):
             payload = {
                 'chat_id': TELEGRAM_CHAT_ID,
                 'text': msg,
@@ -1405,7 +1419,20 @@ async def send_telegram_notification(
                 'disable_web_page_preview': True
             }
 
+            logger.info(
+                "Attempting Telegram delivery for %s message %d/%d (%d opportunities)",
+                message_type,
+                index,
+                len(messages),
+                len(message_jobs),
+            )
             if not await _deliver_telegram_message(session, url, payload):
+                logger.error(
+                    "Telegram did not confirm %s message %d/%d",
+                    message_type,
+                    index,
+                    len(messages),
+                )
                 return False
             if on_delivered:
                 await on_delivered(message_jobs)
@@ -1513,13 +1540,18 @@ def is_daily_digest_due(
     now: datetime,
     last_digest_date: str,
     event_name: str,
-    heartbeat_hour_utc: int = 23,
-    heartbeat_minute_utc: int = 55,
+    heartbeat_hour_utc: int = 0,
+    heartbeat_minute_utc: int = 30,
 ) -> bool:
     return (
         event_name == 'schedule'
-        and now.hour == heartbeat_hour_utc
-        and now.minute >= heartbeat_minute_utc
+        and (
+            now.hour > heartbeat_hour_utc
+            or (
+                now.hour == heartbeat_hour_utc
+                and now.minute >= heartbeat_minute_utc
+            )
+        )
         and now.date().isoformat() != last_digest_date
     )
 
@@ -1716,15 +1748,46 @@ async def main(
                 logger.info("No high-priority opportunities found")
 
             now_utc = datetime.now(timezone.utc)
+            heartbeat_hour_utc = int(
+                NOTIFICATIONS_CONFIG.get('heartbeat_hour_utc', 0)
+            )
+            heartbeat_minute_utc = int(
+                NOTIFICATIONS_CONFIG.get('heartbeat_minute_utc', 30)
+            )
+            event_name = os.getenv('GITHUB_EVENT_NAME', '')
+            digest_time_reached = (
+                now_utc.hour > heartbeat_hour_utc
+                or (
+                    now_utc.hour == heartbeat_hour_utc
+                    and now_utc.minute >= heartbeat_minute_utc
+                )
+            )
             digest_due = is_daily_digest_due(
                 now_utc,
                 scraper.last_digest_date,
-                os.getenv('GITHUB_EVENT_NAME', ''),
-                int(NOTIFICATIONS_CONFIG.get('heartbeat_hour_utc', 23)),
-                int(NOTIFICATIONS_CONFIG.get('heartbeat_minute_utc', 55)),
+                event_name,
+                heartbeat_hour_utc,
+                heartbeat_minute_utc,
+            )
+            logger.info(
+                "Daily summary schedule check: event=%s now_utc=%s target_utc=%02d:%02d "
+                "time_reached=%s due=%s last_digest_date=%s",
+                event_name,
+                now_utc.isoformat(),
+                heartbeat_hour_utc,
+                heartbeat_minute_utc,
+                digest_time_reached,
+                digest_due,
+                scraper.last_digest_date or 'none',
             )
             digest_jobs = scraper.get_pending_digest() if digest_due else []
+            if digest_due:
+                logger.info(
+                    "Daily summary is due; %d opportunities will be included",
+                    len(digest_jobs),
+                )
             if digest_jobs:
+                logger.info("Attempting Telegram delivery for daily summary")
                 if not await send_telegram_notification(
                     digest_jobs,
                     daily_digest=True,
@@ -1733,6 +1796,14 @@ async def main(
                     raise RuntimeError(
                         "Daily digest failed. Delivered batches were saved; remaining opportunities will retry."
                     )
+                logger.info(
+                    "Telegram confirmed daily summary delivery for %d opportunities",
+                    len(digest_jobs),
+                )
+            elif digest_due:
+                logger.info(
+                    "Daily summary has no pending opportunities; digest message not sent"
+                )
             if digest_due:
                 scraper.last_digest_date = now_utc.date().isoformat()
 
@@ -1753,7 +1824,20 @@ async def main(
             )
             if should_alert or should_heartbeat:
                 status_text = build_status_message(scraper.metrics, len(new_jobs), issues)
-                if not await send_telegram_status(status_text):
+                logger.info(
+                    "Attempting Telegram delivery for %s message",
+                    'failure alert' if should_alert else 'heartbeat',
+                )
+                if await send_telegram_status(status_text):
+                    logger.info(
+                        "Telegram confirmed %s delivery",
+                        'failure alert' if should_alert else 'heartbeat',
+                    )
+                else:
+                    logger.error(
+                        "Telegram did not confirm %s delivery",
+                        'failure alert' if should_alert else 'heartbeat',
+                    )
                     logger.warning("Failed to send status/heartbeat message")
 
             if not scraper.save_seen_jobs():

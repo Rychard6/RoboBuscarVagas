@@ -9,7 +9,9 @@ on:
       - developer
 
   schedule:
-    # Run every 4 hours; 23:55 UTC is 20:55 in Brasília.
+    # Temporary daily summary test at 00:30 UTC (21:30 in Brasília).
+    - cron: "30 0 * * *"
+    # Preserve the recurring search schedule.
     # All configured query groups run each cycle; this is the worst-case alert latency.
     - cron: "55 3,7,11,15,19,23 * * *"
 
